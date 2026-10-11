@@ -41,6 +41,14 @@
 Get-FileHash .\plugin-io.github.motian16.spwremote-1.0.spmod -Algorithm SHA256
 ```
 
+> **⚠️ 构建不可逐字节复现。** 同一份源码在 Windows 和 GitHub Actions 上分别构建，
+> 产出的 `.spmod` **内容相同但 SHA-256 不同** —— zip 会记录每个条目的
+> 修改时间，两次构建的时间戳不一样。
+> 所以 `SHA256SUMS.txt` 只对应**那一次 Release 里上传的那个文件**，
+> 你自己重新构建得到的包校验值必然不同，这是正常的，不代表文件有问题。
+> 想确认包没被动过，就用 Release 附带的 `SHA256SUMS.txt`；
+> 想知道包是谁构建的，各条 Release 的说明里都写明了对应的 tag 与提交。
+
 `.spmod` 就是标准 zip，可以自己解开看：
 
 ```powershell
