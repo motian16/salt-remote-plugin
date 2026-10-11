@@ -88,13 +88,18 @@ try {
 
     function Invoke-Git {
         param([string[]]$GitArgs, [switch]$AllowFail, [string]$Proxy = '')
-        # env var 方式比 -c 参数更可靠：git 会自己读取，不受参数解析影响
         if ($Proxy) { $env:HTTP_PROXY = $Proxy; $env:HTTPS_PROXY = $Proxy }
+        # git 会把 "To https://..." 之类的进度信息写到 stderr。脚本顶部把
+        # $ErrorActionPreference 设成 Stop，原生命令的 stderr 会被当成终止性错误，
+        # 于是明明成功的 push 也会中断脚本 —— 临时放宽，只靠 exit code 判断成败。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         try {
             $out = & git @GitArgs 2>&1
             $code = $LASTEXITCODE
         }
         finally {
+            $ErrorActionPreference = $prevEap
             if ($Proxy) { Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY -ErrorAction SilentlyContinue }
         }
         if ($code -ne 0 -and -not $AllowFail) {
@@ -248,18 +253,26 @@ try {
     $pushUrl = "https://github.com/$Repository.git"
     $gitAuth = @('-c', "http.https://github.com/.extraheader=$authHeader")
 
-    # 推送同样走代理（git 读 HTTP(S)_PROXY 环境变量）
+    # 推送同样走代理（git 读 HTTP(S)_PROXY 环境变量）。
+    # 同样要放宽 $ErrorActionPreference：git 的进度信息走 stderr，会被当成终止性错误。
     if ($script:sysProxy) { $env:HTTP_PROXY = $script:sysProxy; $env:HTTPS_PROXY = $script:sysProxy }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
-        & git @gitAuth push $pushUrl "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
-        if ($LASTEXITCODE -ne 0) { Fail '推送分支失败' }
+        $pushOut = & git @gitAuth push $pushUrl "refs/heads/${branch}:refs/heads/${branch}" 2>&1
+        $pushCode = $LASTEXITCODE
+        Dim ($pushOut | Out-String)
+        if ($pushCode -ne 0) { Fail '推送分支失败' }
         Ok "  分支 $branch 已推送"
 
-        & git @gitAuth push $pushUrl "refs/tags/${tag}:refs/tags/${tag}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
-        if ($LASTEXITCODE -ne 0) { Fail '推送 tag 失败' }
+        $tagOut = & git @gitAuth push $pushUrl "refs/tags/${tag}:refs/tags/${tag}" 2>&1
+        $tagCode = $LASTEXITCODE
+        Dim ($tagOut | Out-String)
+        if ($tagCode -ne 0) { Fail '推送 tag 失败' }
         Ok "  tag $tag 已推送"
     }
     finally {
+        $ErrorActionPreference = $prevEap
         Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY -ErrorAction SilentlyContinue
     }
 
