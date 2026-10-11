@@ -342,11 +342,25 @@ __SUMS__
         @{ Path = $zipPath; Name = $zipName; Type = 'application/zip' },
         @{ Path = $sumsFile; Name = 'SHA256SUMS.txt'; Type = 'text/plain' }
     )
+    # 附件上传必须走 uploads.github.com。
+    #   - 不能用 API 返回的 upload_url：那台主机在部分网络下被解析成
+    #     "invalid URI / 无法解析主机名"（.NET 与 curl 都可能出问题），
+    #     直接用固定的 uploads.github.com 更稳。
+    #   - Invoke-RestMethod 会把文件字节原样发出，不要经 curl.exe 转发：
+    #     这条链路上系统代理会把它变成空响应，导致上传静默失败。
+    $uploadBase = "https://uploads.github.com/repos/$Repository/releases/$($release.id)/assets"
     foreach ($asset in $assets) {
-        $uploadUrl = ($release.upload_url -replace '\{\?name,label\}', '') + '?name=' + [uri]::EscapeDataString($asset.Name)
+        $uploadUrl = $uploadBase + '?name=' + [uri]::EscapeDataString($asset.Name)
         $res = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers `
             -ContentType $asset.Type -InFile $asset.Path -TimeoutSec 600
-        Ok "  上传 $($asset.Name)"
+        if (-not $res.browser_download_url) { Fail "上传 $($asset.Name) 失败：响应里没有下载地址" }
+        # 事后核对：GitHub 回传的 sha256 必须和本地算出来的一致
+        $expected = if ($asset.Name -eq 'SHA256SUMS.txt') { '' } else { $hashSpmod }
+        $got = ($res.digest -replace '^sha256:', '')
+        if ($expected -and $got -ne $expected) {
+            Fail "上传后校验失败：$($asset.Name) 远端 sha256=$got，本地=$expected"
+        }
+        Ok "  上传 $($asset.Name)（$($res.size) 字节，sha256 已核对）"
         Dim "    $($res.browser_download_url)"
     }
 

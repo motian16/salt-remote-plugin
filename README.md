@@ -111,7 +111,26 @@ $env:GITHUB_TOKEN = '<你的 token>'
 
 它会依次：解析版本号 → 检查工作区是否干净 → 构建 → 校验包内 MANIFEST 与
 `build.gradle.kts` 一致 → 确认 tag 未占用 → 提交并打 tag `v<版本>` → 推送 →
-建 GitHub Release 并上传三个附件。加 `-SkipPush` 可以只构建提交不推送。
+建 GitHub Release 并上传三个附件（上传后会核对 GitHub 回传的 sha256）。
+加 `-SkipPush` 可以只构建提交不推送。
+
+脚本需要 `GITHUB_TOKEN` 环境变量，令牌只以一次性 Authorization 头传给 git，
+不写进 `.git/config`。如果本机上网走系统代理，脚本会从注册表读出代理并以
+`HTTP(S)_PROXY` 注入 git —— git 默认**不**使用系统代理，否则推送会报
+`Connection was reset`。
+
+### CI
+
+`.github/workflows/build.yml` 会在每次 push / PR 时用 JDK 25 构建 `.spmod` 并
+把它作为 workflow artifact 上传；推送 `v*` tag 时额外自动创建 Release。
+
+> 首次提交时 `gradlew` 在 Windows 上被检出了 `100644`（无执行位），
+> 导致 Linux runner 上 `Permission denied`。已在 git index 里改成 `100755`：
+> ```powershell
+> git update-index --chmod=+x gradlew
+> ```
+> 在 Windows 上重新克隆后如果 CI 又报 `Permission denied`，先查 `git ls-files -s gradlew`
+> 是不是 `100755`。
 
 ---
 
