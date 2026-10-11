@@ -38,7 +38,7 @@
 
 ```powershell
 # 和 Release 里的 SHA256SUMS.txt 对照
-Get-FileHash .\plugin-io.github.motian16.spwremote-1.0.spmod -Algorithm SHA256
+Get-FileHash .\plugin-io.github.motian16.spwremote-1.2.spmod -Algorithm SHA256
 ```
 
 > **⚠️ 构建不可逐字节复现。** 同一份源码在 Windows 和 GitHub Actions 上分别构建，
@@ -53,8 +53,25 @@ Get-FileHash .\plugin-io.github.motian16.spwremote-1.0.spmod -Algorithm SHA256
 
 ```powershell
 # 包内顶层只有 classes/，插件元数据在 classes/META-INF/MANIFEST.MF
-tar -tf plugin-io.github.motian16.spwremote-1.0.spmod
+tar -tf plugin-io.github.motian16.spwremote-1.2.spmod
 ```
+
+包内 MANIFEST 全部字段（`lib/` 为空，归档里没有这一层目录）：
+
+```
+Plugin-Class:            io.github.motian16.spwremote.RemotePlugin
+Plugin-Id:               io.github.motian16.spwremote
+Plugin-Version:          1.2
+Plugin-Provider:         motian16
+Plugin-Name:             SPW 远程遥控
+Plugin-Description:      手机遥控电脑播放（局域网/公网）
+Plugin-Open-Source-Url:  https://github.com/motian16/salt-remote-plugin
+Plugin-Has-Config:       true
+```
+
+`Plugin-Open-Source-Url` 由 `build.gradle.kts` 里 `spmod { PluginOpenSourceUrl = ... }`
+声明，宿主会用它展示插件来源（开源地址），所以**每个版本都必须带上**。
+`PluginDescription` 注释里那条「单行 72 字节」的限制只针对描述这一类中文字段。
 
 ---
 
@@ -102,10 +119,14 @@ $env:JAVA_HOME = "<你的 JDK 25 路径>"
 产物：
 
 ```
-build/libs/plugin-io.github.motian16.spwremote-1.0.spmod   ← 约 132 KB
-build/libs/spw-remote-1.0.zip                             ← 同一文件，改名副本
+build/libs/plugin-io.github.motian16.spwremote-1.2.spmod   ← 约 132 KB
+build/libs/spw-remote-1.2.zip                             ← 同一文件，改名副本
 build/libs/SHA256SUMS.txt                                 ← 两者的 SHA-256
 ```
+
+> **Release 里两个附件都要传。** 宿主发布器（Steam 创意工坊）只接受 `.spmod`，
+> 但一部分导入方式和第三方工具只认 `.zip`，所以每个 Release 同时提供
+> `.spmod` 与内容完全相同的 `.zip`，两者 SHA-256 一致。
 
 ### 发布新版本
 
