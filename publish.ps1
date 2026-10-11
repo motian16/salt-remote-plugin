@@ -72,15 +72,42 @@ try {
     function Warn([string]$Message) { Write-Host $Message -ForegroundColor Yellow }
     function Dim([string]$Message) { Write-Host $Message -ForegroundColor DarkGray }
 
+    # 本机若有系统代理，git 默认不会用它（curl/.NET 会自动用），于是访问 GitHub 会报
+    # "Recv failure: Connection was reset" / "Could not connect to server"。
+    # 从注册表读一次，用 HTTP(S)_PROXY 环境变量注入（git 对这两个变量有原生支持，
+    # 比拼 -c http.proxy 更可靠），用完清掉。
+    function Get-SystemProxy {
+        $raw = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' `
+                -ErrorAction SilentlyContinue).ProxyServer
+        if (-not $raw) { return '' }
+        $p = (($raw -split ';')[0]) -replace '^[a-zA-Z]+=', ''
+        if (-not $p) { return '' }
+        if ($p -notmatch '^https?://') { $p = "http://$p" }
+        return $p
+    }
+
     function Invoke-Git {
-        param([string[]]$GitArgs, [switch]$AllowFail)
-        $out = & git @GitArgs 2>&1
-        $code = $LASTEXITCODE
+        param([string[]]$GitArgs, [switch]$AllowFail, [string]$Proxy = '')
+        # env var 方式比 -c 参数更可靠：git 会自己读取，不受参数解析影响
+        if ($Proxy) { $env:HTTP_PROXY = $Proxy; $env:HTTPS_PROXY = $Proxy }
+        try {
+            $out = & git @GitArgs 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally {
+            if ($Proxy) { Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY -ErrorAction SilentlyContinue }
+        }
         if ($code -ne 0 -and -not $AllowFail) {
             Dim ($out | Out-String)
             Fail ("git " + ($GitArgs -join ' ') + " 失败（exit $code）")
         }
         [PSCustomObject]@{ Code = $code; Output = (($out | Out-String).Trim()) }
+    }
+
+    # 带代理（或原样）执行一条 git 命令，返回 "命令前缀" 供 push 复用
+    function Invoke-GitNetwork {
+        param([string[]]$GitArgs, [switch]$AllowFail)
+        Invoke-Git -GitArgs $GitArgs -AllowFail:$AllowFail -Proxy $script:sysProxy
     }
 
     # ------------------------------------------------- 1. read plugin version
@@ -134,9 +161,13 @@ try {
     }
     Write-Host "  repository    : $Repository"
 
+    # 代理只用于访问远端的操作（ls-remote / push / API），纯本地操作不受影响
+    $script:sysProxy = Get-SystemProxy
+    if ($script:sysProxy) { Write-Host "  proxy         : $script:sysProxy" }
+
     $localTag = Invoke-Git @('rev-parse', '--verify', '--quiet', "refs/tags/$tag") -AllowFail
     if ($localTag.Code -eq 0) { Fail "本地已存在 tag $tag。改 build.gradle.kts 的 PluginVersion 再发布。" }
-    $remoteTag = Invoke-Git @('ls-remote', '--tags', $Remote, "refs/tags/$tag") -AllowFail
+    $remoteTag = Invoke-GitNetwork @('ls-remote', '--tags', $Remote, "refs/tags/$tag") -AllowFail
     if ($remoteTag.Code -eq 0 -and $remoteTag.Output) { Fail "远端 $Remote 已存在 tag $tag，不能重复发布。" }
 
     # -------------------------------------------------------------- 3. build
@@ -217,13 +248,20 @@ try {
     $pushUrl = "https://github.com/$Repository.git"
     $gitAuth = @('-c', "http.https://github.com/.extraheader=$authHeader")
 
-    & git @gitAuth push $pushUrl "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
-    if ($LASTEXITCODE -ne 0) { Fail '推送分支失败' }
-    Ok "  分支 $branch 已推送"
+    # 推送同样走代理（git 读 HTTP(S)_PROXY 环境变量）
+    if ($script:sysProxy) { $env:HTTP_PROXY = $script:sysProxy; $env:HTTPS_PROXY = $script:sysProxy }
+    try {
+        & git @gitAuth push $pushUrl "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
+        if ($LASTEXITCODE -ne 0) { Fail '推送分支失败' }
+        Ok "  分支 $branch 已推送"
 
-    & git @gitAuth push $pushUrl "refs/tags/${tag}:refs/tags/${tag}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
-    if ($LASTEXITCODE -ne 0) { Fail '推送 tag 失败' }
-    Ok "  tag $tag 已推送"
+        & git @gitAuth push $pushUrl "refs/tags/${tag}:refs/tags/${tag}" 2>&1 | Out-String | ForEach-Object { Dim $_ }
+        if ($LASTEXITCODE -ne 0) { Fail '推送 tag 失败' }
+        Ok "  tag $tag 已推送"
+    }
+    finally {
+        Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+    }
 
     # ------------------------------------------------------------- 6. release
     Info '== 6/6 创建 GitHub Release =='
