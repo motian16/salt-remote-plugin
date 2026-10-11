@@ -1,378 +1,244 @@
-# SPW 遥控插件（Salt Player for Windows）
+SPW 遥控插件
 
-用手机遥控电脑上的 Salt Player for Windows。插件在电脑侧起一个 **WebSocket** 服务，
-手机连上后就能播放/暂停/切歌/拖进度，并实时收到当前播放状态。
+Salt Player for Windows Remote Control Plugin
 
-- **局域网**：UDP 自动发现，手机不用手输 IP
-- **公网直连**：有动态公网 IPv4 或全局 IPv6 时，手机不在同一网段也能连
-- **Tailscale**：走同一套协议，APP 侧不需要区分
-- **配对码鉴权**：连接必须先用配对码配对，配对前拿不到播放状态
+通过手机远程控制电脑上的 Salt Player for Windows，支持播放、暂停、切歌、进度调整和播放状态同步。
 
-> 本插件只做**播放控制**与状态回推，不做听歌统计。
+功能特性
 
----
+- 局域网自动发现：通过 UDP 发现电脑，无需手动输入 IP 地址。
+- 跨网络连接：支持公网 IPv4、全局 IPv6 和 Tailscale。
+- 实时状态同步：获取当前曲目、艺术家、专辑、播放状态和播放进度。
+- 配对码鉴权：连接后需要进行配对验证。
+- 轻量化实现：不依赖额外的 WebSocket 库。
+- 不收集听歌统计：仅负责播放控制与状态传输。
 
-## 一、下载与安装
+下载与安装
 
-**发行版**：<https://github.com/motian16/salt-remote-plugin/releases/latest>
+下载地址： https://github.com/motian16/salt-remote-plugin/releases/latest
 
-每个 Release 提供三个附件：
+每个 Release 提供以下文件：
 
-| 附件 | 说明 |
-| --- | --- |
-| `plugin-io.github.motian16.spwremote-<版本>.spmod` | 插件包，推荐用这个 |
-| `spw-remote-<版本>.zip` | **与 `.spmod` 内容完全相同**的副本，只是扩展名不同 |
-| `SHA256SUMS.txt` | 上面两个文件的 SHA-256 |
+文件| 说明
+"plugin-io.github.motian16.spwremote-<版本>.spmod"| 插件安装包，推荐使用
+"spw-remote-<版本>.zip"| 与 ".spmod" 内容相同的 ZIP 副本
+"SHA256SUMS.txt"| 下载文件的 SHA-256 校验值
 
-安装步骤：
+安装步骤
 
-1. 下载 `.spmod`（或 `.zip`）
-2. Salt Player → **创意工坊** → **本地导入** → 选择该文件
-3. **在创意工坊里启用它**
+1. 下载 ".spmod" 文件，也可以使用 ".zip" 副本。
+2. 打开 Salt Player，进入「创意工坊」→「本地导入」。
+3. 选择下载的插件文件并完成导入。
+4. 在创意工坊中启用插件。
 
-> **导入 ≠ 启用。** 插件只有被启用后 `start()` 才会执行，端口才会开始监听。
-> 启用成功会弹一条 toast，里面是监听地址和局域网地址：
-> `SPW 遥控已监听 ws://0.0.0.0:52100（局域网：192.168.0.106）`
+注意：导入插件不等于启用插件。 只有启用后，插件才会启动并监听连接。
 
-校验下载到的包：
+启用成功后，可在提示信息中查看监听端口和局域网地址，例如：
 
-```powershell
-# 和 Release 里的 SHA256SUMS.txt 对照
-Get-FileHash .\plugin-io.github.motian16.spwremote-1.2.spmod -Algorithm SHA256
-```
+SPW 遥控已监听 ws://0.0.0.0:52100（局域网：192.168.0.106）
 
-> **⚠️ 构建不可逐字节复现。** 同一份源码在 Windows 和 GitHub Actions 上分别构建，
-> 产出的 `.spmod` **内容相同但 SHA-256 不同** —— zip 会记录每个条目的
-> 修改时间，两次构建的时间戳不一样。
-> 所以 `SHA256SUMS.txt` 只对应**那一次 Release 里上传的那个文件**，
-> 你自己重新构建得到的包校验值必然不同，这是正常的，不代表文件有问题。
-> 想确认包没被动过，就用 Release 附带的 `SHA256SUMS.txt`；
-> 想知道包是谁构建的，各条 Release 的说明里都写明了对应的 tag 与提交。
+配置说明
 
-`.spmod` 就是标准 zip，可以自己解开看：
+插件的配置入口位于 Salt Player 的插件配置页面。
 
-```powershell
-# 包内顶层只有 classes/，插件元数据在 classes/META-INF/MANIFEST.MF
-tar -tf plugin-io.github.motian16.spwremote-1.2.spmod
-```
+配置项| 默认值| 说明
+"remote.port"| "52100"| WebSocket 监听端口，范围为 1024–65535
+"remote.udpPort"| "52101"| UDP 自动发现端口
+"remote.token"| 首次运行随机生成| 连接配对码
+"remote.discovery"| 开启| 是否启用局域网自动发现
+"remote.publicIpProbe"| 开启| 是否探测公网 IPv4
+"remote.trustLan"| 开启| 是否允许局域网发现时直接获取配对码
 
-包内结构（`lib/` 为空，归档里没有这一层目录）：
+配对码
 
-```
-plugin-io.github.motian16.spwremote-1.2.spmod
-└── classes/
-    ├── META-INF/MANIFEST.MF      ← 插件元数据，见下
-    ├── META-INF/extensions.idx   ← PF4J 扩展点索引
-    ├── preference_config.json    ← 配置界面声明
-    └── io/github/motian16/spwremote/*.class
-```
+首次运行时，插件会生成随机配对码并保存到配置中，后续启动继续使用。
 
-包内 MANIFEST 全部字段：
+配对码格式为 "SPW-" 加 8 位大写字母或数字，例如：
 
-```
-Plugin-Class:            io.github.motian16.spwremote.RemotePlugin
-Plugin-Id:               io.github.motian16.spwremote
-Plugin-Version:          1.2
-Plugin-Provider:         motian16
-Plugin-Name:             SPW 远程遥控
-Plugin-Description:      手机遥控电脑播放（局域网/公网）
-Plugin-Open-Source-Url:  https://github.com/motian16/salt-remote-plugin
-Plugin-Has-Config:       true
-```
+SPW-7K2M9QX4
 
-`Plugin-Open-Source-Url` 由 `build.gradle.kts` 里 `spmod { PluginOpenSourceUrl = ... }`
-声明，宿主会用它展示插件来源（开源地址），所以**每个版本都必须带上**。
-`PluginDescription` 注释里那条「单行 72 字节」的限制只针对描述这一类中文字段。
+可以在配置页面修改配对码；留空或少于 4 个字符时，会重新生成随机配对码。
 
----
+局域网免配对
 
-## 二、为什么自带 WebSocket 实现
+开启后，同一局域网内的手机可以通过自动发现获取配对码，减少手动输入步骤。
 
-宿主运行时是 jpackage 裁剪过的自定义 JRE，`runtime/legal/` 下**只有 18 个模块**：
+关闭后，手机需要手动输入配对码。
 
-```
-java.base  java.compiler  java.datatransfer  java.desktop  java.instrument
-java.logging  java.management  java.naming  java.prefs
-java.security.jgss  java.security.sasl  java.sql  java.transaction.xa  java.xml
-jdk.accessibility  jdk.crypto.ec  jdk.security.auth  jdk.unsupported
-```
+- 家庭私人网络：可根据便利性决定是否开启。
+- 宿舍、公司、公共 Wi-Fi：建议关闭。
 
-**`jdk.httpserver` 与 `java.net.http` 都不在里面** —— 宿主既没有内置 HTTP 服务端，
-也没有内置 HTTP 客户端。所以 `WsServer.kt` 只用 `java.base` 的
-`ServerSocket` / `Socket` / `MessageDigest` / `Base64` 实现了 RFC6455 的服务端子集
-（文本帧、掩码解码、分片重组、ping/pong、close、心跳与读空闲超时）。
+安全提示： 开启此功能会将配对码附加到局域网 UDP 发现广播中，同一网络内的其他设备可能获取该配对码。
 
-好处是 **`.spmod` 的 `lib/` 保持为空**，插件包很小，也不会往宿主那个只有 `-Xmx512M`
-的堆里塞额外依赖。`jdk.crypto.ec` 在，所以将来要上 `wss://`（TLS）是可用的；
-出站 TLS 已经用在公网 IP 探测上（见 `Discovery.kt` 的 `PublicIpResolver`）。
+配置何时生效
 
----
+除 "remote.trustLan" 外，其他配置项均在插件启动时读取。修改后请先停用插件，再重新启用。
 
-## 三、环境要求与构建
+配置页面还提供「查看本机网络地址」功能，可在日志中查看局域网、IPv6 和公网地址等信息。
 
-| 组件 | 要求 | 说明 |
-| --- | --- | --- |
-| JDK | **25 或更高** | `jvmToolchain(25)` + `JVM_25`，API 的字节码版本也是 25 |
-| Gradle | 无需预装 | 用仓库自带 wrapper（Gradle 9.8.0） |
-| Kotlin | 2.4.20 | Gradle 插件自动拉取 |
+连接方式
 
-```powershell
-# 自带脚本（会自己找 JDK 25，找不到才报错）
+插件默认监听 "0.0.0.0"，可通过以下地址连接。
+
+使用场景| 连接地址示例| 额外要求
+同一局域网| "ws://192.168.0.106:52100"| 手机与电脑网络互通
+Tailscale| "ws://100.x.y.z:52100"| 两端 Tailscale 网络互通
+公网 IPv4| "ws://公网IP:52100"| 路由器配置 TCP 端口转发
+全局 IPv6| "ws://[240e:xxxx::xxxx]:52100"| 网络支持 IPv6，且防火墙允许入站连接
+
+以上地址仅为示例，请替换为实际地址。
+
+网络配置注意事项
+
+- WebSocket 默认使用 TCP "52100"，公网 IPv4 连接需要在路由器中配置对应的 TCP 端口转发。
+- UDP "52101" 仅用于局域网自动发现，不需要进行公网端口转发。
+- Tailscale 连接需要两端网络互通；必要时可通过 DERP 中继通信。
+- Windows 防火墙可能阻止入站连接，请检查相关规则。
+- 公网 IPv4、IPv6 和 Tailscale 连接均不会自动启用传输加密。
+
+不建议直接将当前版本的 WebSocket 端口暴露给不可信网络。 当前协议使用明文 "ws://"，且存在未配对连接可能收到播放状态的问题，详见下方「安全注意事项」。
+
+协议与数据能力
+
+通信采用 WebSocket 文本帧，消息内容为 JSON，并通过 "t" 字段区分消息类型。
+
+典型消息包括：
+
+消息| 作用
+"auth"| 提交配对码
+"hello"| 获取协议与连接信息
+"state"| 接收播放状态
+"cmd"| 执行播放控制指令
+"ping" / "pong"| 心跳检测
+"netinfo"| 获取网络地址及诊断信息
+
+完整协议字段、消息格式和指令定义请参阅：
+
+- "协议参考" (docs/协议参考.md)
+- "数据传输能力" (docs/数据传输能力.md)
+
+当前接口限制
+
+- 不提供封面数据：宿主公开播放接口不提供原始封面图片数据，手机端需要自行匹配曲库封面。
+- 不提供曲目总时长：宿主公开接口不提供曲目时长，手机端需要通过本地曲库获取时长，才能准确计算进度百分比。
+- 部分状态依赖反射：曲目 ID、播放状态和进度等信息可能因宿主内部实现变化而无法读取，具体可用情况以实际运行结果为准。
+
+安全注意事项
+
+当前版本存在以下安全限制：
+
+项目| 当前行为
+配对码| 首次运行随机生成并保存
+未配对指令| 拒绝执行
+未配对地址查询| 受到鉴权限制
+UDP 发现广播| 默认不包含配对码；开启局域网免配对后会附带配对码
+播放状态广播| 未按配对状态过滤，未配对连接也可能收到播放状态
+传输加密| 未实现，使用明文 "ws://"
+
+未配对连接可能获取播放信息
+
+当前实现的播放状态广播会发送给所有已建立的 WebSocket 连接，不会检查连接是否已完成配对。
+
+因此，即使设备尚未通过配对验证，也可能在后续状态广播中收到曲目标题、艺术家、专辑、文件路径和播放进度等信息。
+
+配对码目前不能完全保护播放状态的隐私。 在该问题修复之前，请避免将服务暴露给不可信网络。
+
+其他限制：
+
+- 同时最多允许 8 个客户端连接，超出上限的连接会被断开。
+- 未实现额外的指令限流机制。
+- 尚未实现 "permessage-deflate" 压缩。
+- Cloudflare Tunnel 等广域网中转方案尚未实现。
+
+开发与构建
+
+环境要求
+
+组件| 要求
+JDK| 25 或更高版本
+Gradle| 使用仓库自带的 Gradle Wrapper
+Kotlin| 2.4.20，由 Gradle 插件管理
+
+注意：Salt Player 自带的运行时不包含完整的 Java 编译工具链，不能直接用于插件编译。
+
+构建
+
+Windows 下执行：
+
 .\build.ps1
 
-# 或者手动
+也可以手动指定 JDK：
+
 $env:JAVA_HOME = "<你的 JDK 25 路径>"
 .\gradlew.bat plugin
-```
 
-> 宿主的 `runtime/bin` 里只有 DLL，没有 `javac`/`jar`，**不能拿宿主的 JRE 来编译**。
+构建产物位于 "build/libs/"：
 
-产物：
+- "plugin-io.github.motian16.spwremote-<版本>.spmod"
+- "spw-remote-<版本>.zip"
+- "SHA256SUMS.txt"
 
-```
-build/libs/plugin-io.github.motian16.spwremote-1.2.spmod   ← 约 132 KB
-build/libs/spw-remote-1.2.zip                             ← 同一文件，改名副本
-build/libs/SHA256SUMS.txt                                 ← 两者的 SHA-256
-```
+".zip" 是 ".spmod" 的副本，两个文件应具有相同的 SHA-256。
 
-> **Release 里两个附件都要传。** 宿主发布器（Steam 创意工坊）只接受 `.spmod`，
-> 但一部分导入方式和第三方工具只认 `.zip`，所以每个 Release 同时提供
-> `.spmod` 与内容完全相同的 `.zip`，两者 SHA-256 一致。
+发布新版本
 
-### 发布新版本
+版本号统一维护在 "build.gradle.kts" 的 "spmod" 配置中。
 
-版本号的唯一来源是 `build.gradle.kts` 里 `spmod { PluginVersion = "..." }`。
-改完跑：
+设置 "GITHUB_TOKEN" 后执行：
 
-```powershell
-$env:GITHUB_TOKEN = '<你的 token>'
 .\publish.ps1
-```
 
-它会依次：解析版本号 → 检查工作区是否干净 → 构建 → 校验包内 MANIFEST 与
-`build.gradle.kts` 一致 → 确认 tag 未占用 → 提交并打 tag `v<版本>` → 推送 →
-建 GitHub Release 并上传三个附件（上传后会核对 GitHub 回传的 sha256）。
-加 `-SkipPush` 可以只构建提交不推送。
+脚本负责构建、检查版本与工作区状态、创建 Git 标签、推送代码并发布 GitHub Release。
 
-脚本需要 `GITHUB_TOKEN` 环境变量，令牌只以一次性 Authorization 头传给 git，
-不写进 `.git/config`。如果本机上网走系统代理，脚本会从注册表读出代理并以
-`HTTP(S)_PROXY` 注入 git —— git 默认**不**使用系统代理，否则推送会报
-`Connection was reset`。
+如需仅执行本地构建和提交、不推送远端，可使用：
 
-### CI
+.\publish.ps1 -SkipPush
 
-`.github/workflows/build.yml` 会在每次 push / PR 时用 JDK 25 构建 `.spmod` 并
-把它作为 workflow artifact 上传；推送 `v*` tag 时额外自动创建 Release。
+持续集成
 
-> 首次提交时 `gradlew` 在 Windows 上被检出了 `100644`（无执行位），
-> 导致 Linux runner 上 `Permission denied`。已在 git index 里改成 `100755`：
-> ```powershell
-> git update-index --chmod=+x gradlew
-> ```
-> 在 Windows 上重新克隆后如果 CI 又报 `Permission denied`，先查 `git ls-files -s gradlew`
-> 是不是 `100755`。
+GitHub Actions 会在 push 和 pull request 时执行构建，并上传构建产物；推送符合 "v*" 格式的 Git 标签时，还会自动创建 Release。
 
----
+测试
 
-## 四、配置
+仓库提供独立测试客户端，可在不修改手机 APP 的情况下验证配对流程。
 
-插件配置页由 `src/main/resources/preference_config.json` 声明，配置键如下。
+详细说明见 "test-client/README.md" (test-client/README.md)。
 
-**修改后需要「停用再启用插件」才生效的**（只在 `start()` 时读一次）：
+示例：
 
-| 配置键 | 默认值 | 说明 |
-| --- | --- | --- |
-| `remote.port` | `52100` | WebSocket 监听端口，取值范围 1024–65535 |
-| `remote.udpPort` | `52101` | 自动发现 UDP 端口 |
-| `remote.token` | 首次运行随机生成 | 配对码。留空或少于 4 字符会重新随机生成 |
-| `remote.discovery` | 开 | 关闭后手机必须手动填 IP 和端口 |
-| `remote.publicIpProbe` | 开 | 探测公网 IPv4。纯内网环境可以关掉 |
-
-> 上面两组对应**两个不同的配置文件**：`config.json`（远程遥控）与
-> `discovery.json`（发现与公网）。官方示例里每个配置组用各自独立的文件，
-> **两组共用同一个文件会让设置页渲染不出任何控件**（实测踩过，见下方"已知坑"）。
-
-**改完立即生效的**：
-
-| 配置键 | 默认值 | 说明 |
-| --- | --- | --- |
-| `remote.trustLan` | 开 | 「局域网免配对」：广播里附带配对码，手机扫到即连 |
-
-配置页还有一个「查看本机网络地址」按钮，会把局域网 / IPv6 / 公网地址打到日志里。
-
-### 配对码
-
-格式 `SPW-` + 8 位大写字母数字（字母表已去掉容易看错的 `I/O/0/1`），
-例如 `SPW-7K2M9QX4`。首次运行用 `SecureRandom` 生成并**写回配置**，
-之后一直沿用，也可以在配置页自己改。
-
-### 「局域网免配对」的取舍
-
-开着的时候，手机发现设备后能自动拿到配对码，用户一个字符都不用打。
-代价是**同网段的人抓一个 UDP 包就能拿到配对码**。
-
-- 家里自己的 Wi-Fi：开着，便利换安全，可以接受
-- 宿舍、公司、咖啡厅这类共享网络：**建议关掉**，关掉后手机必须手填配对码
-
----
-
-## 五、怎么连
-
-插件绑定的是 `0.0.0.0`，所以下面几种地址**同时**可用，不需要改配置：
-
-| 场景 | 手机填什么 |
-| --- | --- |
-| 同一局域网 | `ws://192.168.x.x:52100`（配置页看局域网地址） |
-| Tailscale | `ws://100.x.y.z:52100` |
-| 有动态公网 IPv4 | `ws://<公网 IP>:52100`（记得在路由器上做端口转发） |
-| 有全局 IPv6 | `ws://[240e:...]:52100`（需要在路由器放行入站） |
-
-要点：
-
-- 端口转发只做 TCP `52100`；UDP `52101` 只在局域网内做发现用，不必转发。
-- Tailscale 两端登录**同一账号**即可，会自动打洞，失败回落到 DERP 中继。
-- **不要**把 Tailscale 的 MagicDNS 主机名当唯一方案，APP 里最好能直接填 IP。
-- Windows 防火墙若拦截入站，局域网会失败但 Tailscale 通常仍可用（走自己的网卡）。
-- 对外网暴露端口前请把配对码换强一点 —— 协议本身是**明文 `ws://`，没有传输加密**。
-
----
-
-## 六、协议
-
-WebSocket 文本帧承载 JSON，所有消息都有 `t` 字段。**完整字段目录见
-[`docs/协议参考.md`](docs/协议参考.md)**，这里只给最短路径。
-
-```
-手机 → 插件                                  插件 → 手机
-{"t":"auth","token":"SPW-XXXXXXXX"}    →     authOk
-                                       →     hello   {"ok":true,"protocol":1,...}
-                                       →     state   {"playing":...,"title":...}
-{"t":"ping","ts":123}                  →     pong    {"ts":123}
-{"t":"netinfo"}                        →     netinfo {"lan":[...],"ipv6":[...],...}
-{"t":"cmd","id":1,"action":"play"}     →     ack     {"id":1,"ok":true}
-```
-
-**配对是第一步。** 连上后插件先发 `authRequired`，在收到正确的 `auth` 之前，
-`cmd` / `hello` / `netinfo` 一律回 `authRequired`（只有 `ping` 放行）。
-配对成功后插件会主动对一次账，所以「本来就在播」的情况下也能立刻拿到曲目。
-
-`state` 的 11 个字段：`playing` `title` `artist` `album` `albumArtist` `path`
-`pos` `id` `lyric` `ts`（`pos` 单位毫秒；`id`/`lyric` 拿不到时是空串）。
-
-### 宿主当前版本的接口限制
-
-当前宿主公开接口（`PlaybackExtensionPoint.MediaItem`）只给 **5 个字段**：
-`title`、`artist`、`album`、`albumArtist`、`path`。
-
-- **没有封面**：公开接口没有，内部是 Compose 的 `ImageBitmap`，拿不到原始字节。
-  APP 侧应该用自己的曲库按标题/艺术家匹配本地文件取封面。
-- **没有曲目总时长**：所以 `state` 里没有 `duration`，进度条百分比得靠
-  APP 侧匹配到的本地曲目时长来算。
-- **`id` 与播放/暂停、进度靠反射**读宿主内部字段（`TrackReflector.kt`），
-  属于**尽力而为**：读不到就保留事件推来的值，不会报错。
-  `netinfo` 里的 `trackReflector` 字段会告诉你反射是否可用、命中了哪个字段。
-
-详见 [`docs/数据传输能力.md`](docs/数据传输能力.md)。
-
----
-
-## 七、测试（不动 APP）
-
-见 [`test-client/README.md`](test-client/README.md)。最关键的一条是配对流程验证：
-
-```powershell
 cd test-client
 npm install
-node verify-auth.js <IP> 52100 <配对码> wrong-token   # 11 项断言
-```
+node verify-auth.js <IP> 52100 <配对码> wrong-token
 
----
+项目结构
 
-## 八、安全模型（请按实际行为理解）
-
-| 机制 | 现状 |
-| --- | --- |
-| 配对码 | 首次运行 `SecureRandom` 生成，写回配置，显示在配置页 |
-| 未配对时的指令 | 拒绝，回 `authRequired` |
-| 未配对时的地址列表 | 不给（`netinfo` 被鉴权门挡住） |
-| UDP 广播内容 | 只有身份和端口；「局域网免配对」**开启时额外带配对码** |
-| **未配对时的状态广播** | ⚠️ **拿得到**：`state` 广播不按连接过滤，未配对的连接同样收得到 |
-| 传输加密 | 无。局域网明文 `ws://` |
-
-**⚠️ 需要特别注意的一点**：`state` 的广播出口会把消息发给**所有已建立的连接**，
-不做配对过滤。所以「连上但没配对」的设备虽然一开始收不到任何东西
-（`onOpen` 只发 `authRequired`），但**在下一次状态广播时就会收到 `state`**。
-也就是说 `playing/title/artist/path` 这些信息对同网段任何连上端口的程序都是可读的。
-
-`docs/数据传输能力.md` 里"配对成功后才推送播放状态"的说法与当前代码不符，
-已在该文档中标注。**要真正挡住这一点，需要在广播出口按配对状态过滤** ——
-属于已知待修项，不要依赖当前的配对来保护"你在听什么"。
-
-其他已知限制：
-
-- 连接数上限 `maxClients = 8`，超出直接断开，不做排队。
-- 指令无鉴权之外的保护，也没有限流。
-- 未实现 permessage-deflate 压缩（本场景消息很小，无必要）。
-- 广域网无中转时的方案（Cloudflare Tunnel 等）见
-  `../网络遥控与听歌统计插件-架构设计.md` §2.5，尚未实现。
-
----
-
-## 九、代码结构
-
-```
 src/main/kotlin/io/github/motian16/spwremote/
-├── RemotePlugin.kt              # 主类：生命周期、配置、消息分发、配对鉴权
-├── RemotePlaybackExtension.kt   # @Extension：接收宿主播放事件
-├── MediaState.kt                # 状态跟踪 + 广播节流 + 指令执行（PlaybackController）
-├── WsServer.kt                  # 纯 java.base 的 RFC6455 WebSocket 服务端
-├── Discovery.kt                 # UDP 广播自动发现 + NetworkProbe + PublicIpResolver
-├── TrackReflector.kt            # 反射读宿主内部字段拿曲目/播放态/进度
-├── Protocol.kt                  # 协议常量、消息构造、MediaSnapshot
-├── Json.kt                      # 极简 JSON（避免引入第三方库）
-├── PluginSelfTest.kt            # 自测：假宿主 + 真插件
-├── WsServerSelfTest.kt          # 自测：只用 java.base 的 WS 服务端
-└── DiscoverySelfTest.kt         # 自测：UDP 广播与地址探测
+├── RemotePlugin.kt
+├── RemotePlaybackExtension.kt
+├── MediaState.kt
+├── WsServer.kt
+├── Discovery.kt
+├── TrackReflector.kt
+├── Protocol.kt
+├── Json.kt
+├── PluginSelfTest.kt
+├── WsServerSelfTest.kt
+└── DiscoverySelfTest.kt
+
 src/main/resources/
-└── preference_config.json       # 配置界面声明
-```
+└── preference_config.json
 
-### 两个必须遵守的宿主约束
+主要模块：
 
-1. **不要在构造函数里访问 `WorkshopApi`。**
-   宿主创建插件实例的时机早于 `WorkshopApi.instance` 注入。
-   所有 API 访问都要推迟到 `start()` 之后 —— 本插件的构造函数只做字段初始化。
-2. **不要碰 `changeExclusive`。**
-   它必须在主线程调用，且**禁止在 `onIsPlayingChanged` 回调里调用**。本插件完全不用它。
+- "RemotePlugin.kt"：插件生命周期、配置与消息分发。
+- "MediaState.kt"：播放状态管理、指令执行与广播。
+- "WsServer.kt"：WebSocket 服务端。
+- "Discovery.kt"：局域网发现与网络地址探测。
+- "TrackReflector.kt"：读取宿主内部播放信息。
+- "Protocol.kt"：协议定义与消息构造。
 
-### 线程模型
+开发时需注意：插件构造函数中不要访问 "WorkshopApi"；不要调用 "changeExclusive"，以免违反宿主线程约束。
 
-| 来源 | 线程 |
-| --- | --- |
-| WebSocket 读循环 | 每连接一个 `spw-remote-client` 线程 |
-| 状态广播 | 单线程 `spw-remote-broadcast`（串行，天然避免并发写） |
-| 周期对账（每 4 秒） | 单线程 `spw-remote-poll` |
-| 指令执行 | 单线程 `spw-remote-command`，带 3 秒超时 |
-| 启动期探测 / 公网 IP | 单线程 `spw-remote-bg` |
-| UDP 发现 | `spw-disc-broadcast` + `spw-disc-listen` |
-| WebSocket 心跳（每 10 秒） | `spw-remote-heartbeat` |
+许可证
 
-`MediaState` 内部用锁保护快照，广播统一丢到单线程调度器，既保证线程安全，
-也把"每秒一个位置事件"节流成最多每秒一条 `state`（最小间隔 900ms）。
-所有线程都是 daemon。
-
----
-
-## 十、已知坑
-
-| 现象 | 原因 |
-| --- | --- |
-| 插件装上了、能启用，但**设置页一项都不显示**（空白） | `preference_config.json` 里**多个配置组共用了同一个 `config` 文件**。官方示例中每组用各自的文件，共用会让设置页渲染不出来。本插件 v1.2 及以前就有这个问题，v1.3 拆成 `config.json` + `discovery.json` 后正常 |
-| 改了端口/开关不生效 | 除 `remote.trustLan` 外都在 `start()` 里只读一次，需停用再启用 |
-| CI 报 `./gradlew: Permission denied` | `gradlew` 在 Windows 上被检出为无执行位，见「发布新版本 → CI」 |
-
----
-
-## 十一、许可
-
-见 [LICENSE](LICENSE)。
+详见 "LICENSE" (LICENSE)。
