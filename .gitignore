@@ -1,0 +1,28 @@
+# Gradle / Kotlin build output
+build/
+.gradle/
+.kotlin/
+out/
+
+# Gradle local properties
+local.properties
+
+# Gradle wrapper self-update leftovers
+gradle/wrapper/*.part
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+
+# node (test-client)
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

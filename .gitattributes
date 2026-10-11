@@ -1,0 +1,21 @@
+# Normalize line endings so a Windows checkout does not turn every file into a
+# whole-file diff. Git stores LF in the repository; workers get their native
+# ending for text files.
+* text=auto eol=lf
+
+# Windows launcher scripts must keep CRLF: cmd.exe is unreliable with LF-only
+# batch files, and the upstream Gradle wrapper ships them with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+gradlew.bat text eol=crlf
+
+# Binary assets must never be touched.
+*.jar binary
+*.spmod binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.gif binary
+
+# Keep the Gradle wrapper jar and lock files diff-quiet.
+package-lock.json -diff linguist-generated

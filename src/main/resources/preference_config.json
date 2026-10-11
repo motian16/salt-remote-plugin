@@ -1,0 +1,65 @@
+﻿{
+  "configs": [
+    {
+      "title": "远程遥控",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "remote.port",
+          "type": "edittext",
+          "title": "WebSocket 端口",
+          "summary": "手机连接用的端口，默认 52100。修改后需停用再启用插件生效",
+          "default_value": "52100"
+        },
+        {
+          "key": "remote.udpPort",
+          "type": "edittext",
+          "title": "自动发现端口 (UDP)",
+          "summary": "插件周期性广播自己的地址，手机据此自动找到本机。默认 52101",
+          "default_value": "52101"
+        },
+        {
+          "key": "remote.token",
+          "type": "edittext",
+          "title": "配对码",
+          "summary": "手机首次连接时要填这个。首次运行随机生成，可自行修改。留空会重新随机生成一个",
+          "default_value": ""
+        }
+      ]
+    },
+    {
+      "title": "发现与公网",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "remote.discovery",
+          "type": "switch",
+          "title": "启用局域网自动发现",
+          "summary": "关闭后手机必须手动填 IP 和端口才能连上",
+          "default_value": true
+        },
+        {
+          "key": "remote.publicIpProbe",
+          "type": "switch",
+          "title": "探测公网 IP",
+          "summary": "用于把本机的公网 IPv4 一并广播出去，方便有动态公网的用户在外网直连。需要访问 api.ipify.org 等公开服务；纯内网环境可以关掉",
+          "default_value": true
+        },
+        {
+          "key": "remote.trustLan",
+          "type": "switch",
+          "title": "局域网免配对",
+          "summary": "开启时手机首次连接会自动拿到配对码，不用手打；配对码仍显示在下面，第二台设备可以照抄。注意：开启后同网段的设备都能拿到配对码，宿舍/公司网络建议关掉",
+          "default_value": true
+        },
+        {
+          "type": "button",
+          "title": "查看本机网络地址",
+          "summary": "在日志里打印局域网 / IPv6 / 公网地址，排查连不上时用",
+          "arrow_type": "none",
+          "on_click": "io.github.motian16.spwremote.RemotePlugin.onShowNetworkInfo"
+        }
+      ]
+    }
+  ]
+}

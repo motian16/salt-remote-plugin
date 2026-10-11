@@ -1,0 +1,74 @@
+name: Build .spmod
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build plugin package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # The repository ships a wrapper, so Gradle itself needs no download
+          # configuration here beyond using that wrapper.
+          cache-read-only: false
+
+      - name: Show toolchain
+        run: java -version
+
+      - name: Build .spmod
+        run: ./gradlew plugin --no-daemon --stacktrace
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          cp build/libs/*.spmod dist/
+          cd dist
+          # .spmod is a plain zip; publish a .zip copy for import flows that
+          # filter on the extension.
+          for f in *.spmod; do
+            cp "$f" "${f%.spmod}.zip"
+          done
+          sha256sum *.spmod *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -l
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: spmod-package
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.spmod
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

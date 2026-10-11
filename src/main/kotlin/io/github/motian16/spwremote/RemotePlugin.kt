@@ -1,0 +1,508 @@
+﻿package io.github.motian16.spwremote
+
+import com.xuncorp.spw.workshop.api.PluginContext
+import com.xuncorp.spw.workshop.api.SpwPlugin
+import com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi
+import com.xuncorp.spw.workshop.api.WorkshopApi
+import com.xuncorp.spw.workshop.api.config.ConfigHelper
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * SPW 遥控插件主类。
+ *
+ * 做两件事：
+ *   1. **播放控制**：本地监听 WebSocket，把 APP 发来的指令转成
+ *      `WorkshopApi.playback` 调用，并把宿主的播放事件回推给 APP；
+ *   2. **自动发现**：周期性地向局域网广播自己的地址，让 APP 不用手输 IP。
+ *      广播里还带上插件探测到的**公网 IPv4 与全局 IPv6**，
+ *      给"有动态公网"的用户在非局域网场景下留一条路。
+ *
+ * 为什么用自带的 WebSocket 实现：宿主运行时被裁剪过，没有
+ * `jdk.httpserver` / `java.net.http`，且插件包越小越好，
+ * 因此协议实现只用 `java.base`，`lib/` 保持为空。
+ */
+@OptIn(UnstableSpwWorkshopApi::class)
+class RemotePlugin(
+    pluginContext: PluginContext
+) : SpwPlugin(pluginContext) {
+
+    private val started = AtomicBoolean(false)
+
+    private var config: ConfigHelper? = null
+    private var server: WsServer? = null
+    private var discovery: DiscoveryService? = null
+    private var mediaState: MediaState? = null
+    private var controller: PlaybackController? = null
+
+    private var port: Int = DEFAULT_PORT
+    private var udpPort: Int = DEFAULT_UDP_PORT
+    private var authToken: String = ""
+
+    /**
+     * 后台执行器：只用来做"不阻塞插件启动"的活儿 ——
+     * 公网 IP 探测要发网络请求，绝不能卡在 start() 里。
+     */
+    private val background = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "spw-remote-bg").apply { isDaemon = true }
+    }
+
+    // 显式写出参数类型：PublicIpResolver 有两个参数（endpoints 有默认值），
+    // 不加类型时 Kotlin 会在 lambda 重载之间犯迷糊。
+    private val publicIp = PublicIpResolver(log = { msg: String -> logLine(msg) })
+
+    /** 反射读到的曲目信息，供 [MediaState] 主动拉取。失败返回 null，属正常。 */
+    @Volatile
+    private var reflectedTrack: TrackReflector.Track? = null
+
+    /**
+     * 插件日志。
+     *
+     * 名字刻意不叫 `log`：`kotlin.math.log` 会自动导入，
+     * 同名会在 lambda 里产生重载歧义（编译期报 Overload resolution ambiguity）。
+     */
+    private fun logLine(message: String) {
+        runCatching { println("[spw-remote] $message") }
+    }
+
+    override fun start() {
+        if (!started.compareAndSet(false, true)) return
+
+        // 注意：这里才允许访问 WorkshopApi —— 构造函数阶段 instance 可能还没注入
+        config = runCatching {
+            WorkshopApi.manager.createConfigManager().getConfig()
+        }.getOrNull()
+
+        port = readInt(KEY_PORT, DEFAULT_PORT, 1024, 65535)
+        udpPort = readInt(KEY_UDP_PORT, DEFAULT_UDP_PORT, 1024, 65535)
+        authToken = resolveAuthToken()
+
+        val state = MediaState(
+            broadcaster = { broadcastState() },
+            trackSupplier = { readCurrentTrack() }
+        )
+        val ctrl = PlaybackController(state)
+        mediaState = state
+        controller = ctrl
+
+        // 先挂上扩展点，避免宿主在服务端启动期间刚好换曲而漏掉事件
+        RemotePlaybackExtension.attach(state)
+
+        val srv = WsServer(port, WsListener(ctrl, state))
+        server = srv
+        var wsOk = true
+        try {
+            srv.start()
+        } catch (t: Throwable) {
+            // 端口占用等启动失败：不要让异常冒出去影响宿主启用流程，降级为提示
+            wsOk = false
+            server = null
+            toast("SPW 遥控启动失败（端口 $port）：${t.message}", WorkshopApi.Ui.ToastType.Error)
+        }
+
+        // 自动发现独立于 WebSocket：即使 WebSocket 起不来也先别开广播，
+        // 否则会把 APP 引到一个连不上的地址上。
+        if (wsOk && readBool(KEY_DISCOVERY, true)) {
+            val disc = DiscoveryService(
+                udpPort = udpPort,
+                payloadProvider = { beaconJson() },
+                log = { logLine(it) }
+            )
+            discovery = disc
+            try {
+                disc.start()
+            } catch (t: Throwable) {
+                discovery = null
+                logLine("发现服务启动失败：${t.message}")
+            }
+        }
+
+        // 启动时先主动读一次当前曲目：用户很可能"正在播着"才启用插件
+        background.execute {
+            runCatching {
+                state.refreshNow()
+                logLine(
+                    "启动时曲目探测：" + (
+                        reflectedTrack?.let { "${it.title} / ${it.artist}" }
+                            ?: "未取到（" + (TrackReflector.lastError ?: "宿主未播放") + "）"
+                        )
+                )
+            }
+        }
+
+        // 公网 IP 探测放后台，不阻塞 start()
+        if (readBool(KEY_PUBLIC_IP, true)) {
+            background.execute {
+                runCatching { publicIp.resolve(force = true) }
+            }
+        }
+
+        val lan = NetworkProbe.lanIpv4().joinToString(", ").ifEmpty { "无" }
+        toast(
+            if (wsOk) "SPW 遥控已监听 ws://0.0.0.0:$port（局域网：$lan）"
+            else "SPW 遥控未启动，请在插件配置中更换端口",
+            if (wsOk) WorkshopApi.Ui.ToastType.Success else WorkshopApi.Ui.ToastType.Error
+        )
+    }
+
+    /**
+     * 读当前曲目：优先反射（dev20 没有官方接口），结果缓存下来给状态用。
+     */
+    private fun readCurrentTrack(): TrackReflector.Track? {
+        val t = TrackReflector.current(pluginContext.spwVersion)
+        if (t != null) reflectedTrack = t
+        return t
+    }
+
+    override fun stop() {
+        if (!started.compareAndSet(true, false)) return
+
+        RemotePlaybackExtension.attach(null)
+        runCatching { discovery?.stop() }
+        runCatching { server?.stop() }
+        runCatching { controller?.shutdown() }
+        runCatching { mediaState?.shutdown() }
+        discovery = null
+        server = null
+        controller = null
+        mediaState = null
+    }
+
+    override fun delete() {
+        stop()
+        runCatching { background.shutdownNow() }
+    }
+
+    override fun update() {
+        toast("SPW 遥控已更新", WorkshopApi.Ui.ToastType.Success)
+    }
+
+    private fun broadcastState() {
+        val srv = server ?: return
+        val state = mediaState ?: return
+        srv.broadcast(Protocol.state(state.current()))
+    }
+
+    /**
+     * 发现广播的内容。
+     *
+     * **默认只报身份和端口，不报地址列表** —— 广播会被同网段所有人看到，
+     * 把 IP/IPv6/公网地址全放进去，等于把"这台机器开在哪"告诉所有人。
+     * 地址改为配对成功后通过 WebSocket 下发。
+     *
+     * ## 免配对模式（默认开启，可在配置页关掉）
+     *
+     * 开启「局域网免配对」时，广播里**额外带上配对码**。
+     * 这样手机扫到设备就能直接连上，用户一个字符都不用打。
+     *
+     * 代价说清楚：**同网段的人抓一个 UDP 包就能拿到配对码**。
+     * 在家用 Wi-Fi 下这是"便利换安全"，可以接受；
+     * 宿舍、公司、咖啡厅这类共享网络建议在配置页把它关掉 ——
+     * 关掉之后广播里没有配对码，手机必须手填。
+     */
+    private fun beaconJson(): String {
+        val trustLan = readBool(KEY_TRUST_LAN, true)
+        return JsonValue.obj(
+            "t" to JsonValue.of("spw-remote"),
+            "name" to JsonValue.of("Salt Player for Windows"),
+            "plugin" to JsonValue.of(pluginContext.pluginId),
+            "version" to JsonValue.of(pluginContext.pluginVersion),
+            "wsPort" to JsonValue.of(port),
+            "udpPort" to JsonValue.of(udpPort),
+            // 告诉 APP「需要配对」，好让它把输入框摆出来
+            "auth" to JsonValue.of(true),
+            // 免配对模式下把配对码一并广播，手机直接用它连
+            "token" to (if (trustLan) JsonValue.of(authToken) else JsonValue.Null)
+        ).encode()
+    }
+
+    private fun readInt(key: String, fallback: Int, min: Int, max: Int): Int {
+        val raw = runCatching { config?.get(key, fallback.toString()) }.getOrNull()
+        val parsed = raw?.trim()?.toIntOrNull()
+        return if (parsed != null && parsed in min..max) parsed else fallback
+    }
+
+    private fun readBool(key: String, fallback: Boolean): Boolean =
+        runCatching { config?.get(key, fallback) }.getOrNull() ?: fallback
+
+    /**
+     * 配对码。
+     *
+     * **首次运行时随机生成并写回配置**，之后一直沿用（用户也可以在配置页改）。
+     *
+     * 为什么不是写死的默认值：写死的口令等于没有口令 —— 任何人拿到插件包
+     * 就知道默认配对码是多少。随机生成之后，只有能看到这台电脑上
+     * 插件配置页的人才知道它。
+     *
+     * 格式：`SPW-` + 8 位大写字母与数字混合，例如 `SPW-7K2M9QX4`。
+     */
+    private fun resolveAuthToken(): String {
+        val existing = runCatching {
+            config?.get(KEY_TOKEN, "")?.trim()
+        }.getOrNull().orEmpty()
+        if (existing.length >= 4) return existing
+
+        val generated = generateToken()
+        // 写回配置：下次启动还是同一个，用户也能在配置页看到并改
+        runCatching {
+            config?.set(KEY_TOKEN, generated)
+            config?.save()
+        }.onFailure { logLine("配对码写回配置失败：${it.message}") }
+        logLine("已生成随机配对码：$generated")
+        return generated
+    }
+
+    private fun generateToken(): String {
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // 去掉容易看错的 I/O/0/1
+        val random = java.security.SecureRandom()
+        val body = buildString(8) {
+            repeat(8) { append(alphabet[random.nextInt(alphabet.length)]) }
+        }
+        return "SPW-$body"
+    }
+
+    private fun toast(message: String, type: WorkshopApi.Ui.ToastType) {
+        runCatching { WorkshopApi.ui.toast(message, type) }
+    }
+
+    /** 处理一条客户端消息；返回给该客户端的应答（null 表示无应答） */
+    private inner class WsListener(
+        private val controller: PlaybackController,
+        private val state: MediaState
+    ) : WsServer.Listener {
+
+        /**
+         * 每个连接的配对状态。
+         *
+         * 用弱引用集合按 client 记：连接断开时 [onClose] 清掉，
+         * 避免长期运行后集合无限增长。
+         */
+        private val authed = java.util.Collections.newSetFromMap(
+            java.util.WeakHashMap<WsServer.Client, Boolean>()
+        )
+
+        override fun onOpen(client: WsServer.Client) {
+            // 新连接先报"需要配对"，但不推状态 —— 状态要等配对成功再给，
+            // 否则同网段任何人连上来就能看到你在听什么。
+            client.sendText(Protocol.authRequired())
+        }
+
+        override fun onMessage(client: WsServer.Client, text: String) {
+            val json = parseJsonOrNull(text)
+            if (json !is JsonValue.Obj) {
+                client.sendText(Protocol.error("消息不是合法的 JSON 对象"))
+                return
+            }
+
+            val fields = json.fields
+            val type = fields["t"]?.asStringOrNull()
+
+            // 配对之前只放行 auth 和 ping，其余一律拒绝。
+            if (client !in authed && type != "auth") {
+                if (type == "ping") {
+                    client.sendText(Protocol.pong(fields["ts"]?.asLongOrNull()))
+                } else {
+                    client.sendText(Protocol.authRequired())
+                }
+                return
+            }
+
+            when (type) {
+                "auth" -> {
+                    val token = fields["token"]?.asStringOrNull().orEmpty()
+                    if (token == authToken) {
+                        authed.add(client)
+                        client.sendText(Protocol.authOk())
+                        // 配对成功才给状态；先主动对一次账，
+                        // 这样"已经播着"的情况下也能立刻拿到曲目。
+                        state.refreshNow()
+                        client.sendText(
+                            Protocol.helloOk(
+                                appName = "Salt Player for Windows (SPW Remote)",
+                                appVersion = pluginContext.pluginVersion
+                            )
+                        )
+                        client.sendText(Protocol.state(state.current()))
+                        logLine("客户端 ${client.remoteLabel} 配对成功")
+                    } else {
+                        client.sendText(Protocol.authFail("配对码不对"))
+                        logLine("客户端 ${client.remoteLabel} 配对失败：配对码不对")
+                    }
+                }
+
+                "hello" -> {
+                    client.sendText(
+                        Protocol.helloOk(
+                            appName = "Salt Player for Windows (SPW Remote)",
+                            appVersion = pluginContext.pluginVersion
+                        )
+                    )
+                    state.refreshNow()
+                    client.sendText(Protocol.state(state.current()))
+                }
+
+                "ping" -> client.sendText(Protocol.pong(fields["ts"]?.asLongOrNull()))
+
+                // 地址列表：**只在配对成功之后**才下发。
+                // 广播里不带地址，就是为了让"谁知道有哪些地址"这件事
+                // 也受配对码保护。
+                "netinfo", "addrs" -> client.sendText(
+                    JsonValue.obj(
+                        "t" to JsonValue.of("netinfo"),
+                        "name" to JsonValue.of("Salt Player for Windows"),
+                        "wsPort" to JsonValue.of(port),
+                        "udpPort" to JsonValue.of(udpPort),
+                        "lan" to JsonValue.Arr(NetworkProbe.lanIpv4().map { JsonValue.of(it) }),
+                        "ipv6" to JsonValue.Arr(NetworkProbe.globalIpv6().map { JsonValue.of(it) }),
+                        "public" to JsonValue.of(publicIp.resolve()),
+                        // 局域网免配对开启时，把配对码一并交接给手机。
+                        // 手机存下来之后，用户就不用手打这 12 个字符了；
+                        // 界面上仍然显示它，方便用户告诉第二台设备。
+                        "token" to (
+                            if (readBool(KEY_TRUST_LAN, true)) JsonValue.of(authToken)
+                            else JsonValue.Null
+                            ),
+                        // 反射读曲目是否可用，排查"不显示曲目"时最有用的一条
+                        "trackReflector" to JsonValue.of(
+                            if (TrackReflector.isDisabled) {
+                                "不可用：" + (TrackReflector.lastError ?: "未知原因")
+                            } else {
+                                "可用，命中字段 " + (TrackReflector.matchedField ?: "?")
+                            }
+                        )
+                    ).encode()
+                )
+
+                "cmd" -> handleCommand(client, fields)
+
+                null -> client.sendText(Protocol.error("缺少 t 字段"))
+                else -> client.sendText(
+                    Protocol.error("未知消息类型: $type")
+                )
+            }
+        }
+
+        override fun onClose(client: WsServer.Client) {
+            authed.remove(client)
+        }
+
+        private fun handleCommand(client: WsServer.Client, fields: Map<String, JsonValue>) {
+            val id = fields["id"]
+            val action = fields["action"]?.asStringOrNull()
+            if (action.isNullOrBlank()) {
+                client.sendText(Protocol.ack(id, ok = false, err = "缺少 action 字段"))
+                return
+            }
+
+            val posMs = fields["pos"]?.asLongOrNull()
+            // 记下来自哪台设备、执行了什么；seek 额外带上目标秒数，方便对着日志排查
+            logLine(buildString {
+                append("收到来自 ").append(client.remoteLabel).append(" 的指令：")
+                append(actionDescription(action))
+                if (action == Protocol.ACTION_SEEK && posMs != null) {
+                    append("，跳转到 ").append(posMs / 1000).append(" 秒")
+                }
+            })
+
+            val err = controller.execute(action, posMs)
+            client.sendText(Protocol.ack(id, ok = err == null, err = err))
+            if (err == null) {
+                // 指令生效后立刻回推新状态
+                state.onRemoteCommand()
+            } else {
+                logLine("指令 $action 执行失败（来自 ${client.remoteLabel}）：$err")
+            }
+        }
+
+        /**
+         * 日志里显示的中文指令名。
+         * 仅用于打印；协议收发仍用 action 原文（play/pause/...），不受影响。
+         */
+        private fun actionDescription(action: String): String = when (action) {
+            Protocol.ACTION_PLAY -> "继续播放"
+            Protocol.ACTION_PAUSE -> "暂停"
+            Protocol.ACTION_NEXT -> "下一首"
+            Protocol.ACTION_PREV -> "上一首"
+            Protocol.ACTION_SEEK -> "跳转进度"
+            else -> action
+        }
+    }
+
+    companion object {
+        const val DEFAULT_PORT = 52100
+
+        /** 发现广播用的 UDP 端口，和 WebSocket 端口错开，方便网络排查。 */
+        const val DEFAULT_UDP_PORT = 52101
+
+        /**
+         * 默认配对码：8 位大写字母 + 数字混合。
+         *
+         * 只是**出厂默认值**，用户可以在插件配置里改。要求两边一致：
+         * APP 侧 `RemoteControlPrefs.DEFAULT_TOKEN` 必须和这里逐字相同，
+         * 否则开箱即用会连不上。
+         *
+         * **它不会出现在广播包里**，所以同网段的人必须知道它才能连。
+         */
+        const val DEFAULT_TOKEN = "SPW8K3M9"
+
+        const val KEY_PORT = "remote.port"
+        const val KEY_UDP_PORT = "remote.udpPort"
+        const val KEY_DISCOVERY = "remote.discovery"
+        const val KEY_PUBLIC_IP = "remote.publicIpProbe"
+        const val KEY_TOKEN = "remote.token"
+
+        /**
+         * 局域网免配对。
+         *
+         * 开启时：手机连上后插件会把配对码**交接**给它，用户不用手打。
+         * 配对码本身仍然存在、仍然显示在配置页，所以：
+         *   - 第二台设备可以直接照抄这个码连上（用户看得到）；
+         *   - 想禁止自动交接就把它关掉，那时手机必须手填配对码。
+         *
+         * 取舍说清楚：开着的时候，**同网段任何能连上端口的人都能拿到配对码**。
+         * 在家用 Wi-Fi 下这是便利换安全，可接受；在宿舍/公司网络下建议关掉。
+         */
+        const val KEY_TRUST_LAN = "remote.trustLan"
+
+        /**
+         * 配置页「查看本机网络地址」按钮的回调。
+         *
+         * 必须是**静态方法**（preference_config.json 的 on_click 只支持静态方法），
+         * 所以这里不能依赖插件实例，全部走 NetworkProbe 的静态探测。
+         * 结果同时打到日志和 toast —— 地址可能有好几个，toast 会截断，
+         * 完整列表去 Salt Player 的日志里看。
+         */
+        @JvmStatic
+        @JvmName("onShowNetworkInfo")
+        fun onShowNetworkInfo() {
+            val lan = NetworkProbe.lanIpv4()
+            val v6 = NetworkProbe.globalIpv6()
+            val pub = PublicIpResolver().resolve(force = true)
+
+            val detail = buildString {
+                append("局域网 IPv4: ")
+                append(lan.joinToString(", ").ifEmpty { "无" })
+                append("\n全局 IPv6: ")
+                append(v6.joinToString(", ").ifEmpty { "无" })
+                append("\n公网 IPv4: ")
+                append(pub ?: "探测失败（内网环境或无法访问外网）")
+            }
+            println("[spw-remote] ===== 本机网络地址 =====")
+            println("[spw-remote] $detail")
+            println("[spw-remote] ========================")
+
+            val summary = when {
+                lan.isNotEmpty() -> "局域网：${lan.first()}"
+                v6.isNotEmpty() -> "IPv6：${v6.first()}"
+                pub != null -> "公网：$pub"
+                else -> "未发现可用地址"
+            }
+            runCatching {
+                WorkshopApi.ui.toast(
+                    "本机地址 $summary（完整列表见日志）",
+                    WorkshopApi.Ui.ToastType.Success
+                )
+            }
+        }
+    }
+}

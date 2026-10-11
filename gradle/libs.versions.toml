@@ -1,0 +1,16 @@
+[versions]
+kotlin = "2.4.20"
+compose-multiplatform = "1.12.0"
+spw-workshop-api = "0.1.0-dev22"
+pf4j = "3.12.0"
+
+[libraries]
+# JitPack 多模块坐标。注意：api 模块不发布到 com.github.Moriafly:spw-workshop-api
+# （那个坐标下的 jar 是空的，只有 MANIFEST），而是用仓库级 group：
+spw-workshop-api = { group = "com.github.Moriafly.spw-workshop-api", name = "spw-workshop-api", version.ref = "spw-workshop-api" }
+# JitPack 生成的 POM 没有带上游依赖，必须显式声明 API 用到的外部类型
+pf4j = { group = "org.pf4j", name = "pf4j", version.ref = "pf4j" }
+compose-runtime = { group = "org.jetbrains.compose.runtime", name = "runtime", version.ref = "compose-multiplatform" }
+
+[plugins]
+jetbrains-kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
