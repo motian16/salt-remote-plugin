@@ -49,7 +49,7 @@ spmod {
     // UTF-8 中文字符导致宿主读出乱码，所以介绍必须保持在一行以内
     // （前缀 "Plugin-Description: " 占 20 字节，正文控制在 ~50 字节）。
     PluginDescription = "手机遥控电脑播放（局域网/公网）"
-    PluginVersion = "1.2"
+    PluginVersion = "1.3"
     PluginProvider = "motian16"
     // 生成 MANIFEST 里的 Plugin-Open-Source-Url，供宿主展示插件来源
     PluginOpenSourceUrl = "https://github.com/motian16/salt-remote-plugin"

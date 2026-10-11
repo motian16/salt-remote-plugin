@@ -1,4 +1,4 @@
-﻿package io.github.motian16.spwremote
+package io.github.motian16.spwremote
 
 import com.xuncorp.spw.workshop.api.PluginContext
 import com.xuncorp.spw.workshop.api.SpwPlugin
@@ -30,6 +30,7 @@ class RemotePlugin(
     private val started = AtomicBoolean(false)
 
     private var config: ConfigHelper? = null
+    private var discoveryConfig: ConfigHelper? = null
     private var server: WsServer? = null
     private var discovery: DiscoveryService? = null
     private var mediaState: MediaState? = null
@@ -70,7 +71,12 @@ class RemotePlugin(
 
         // 注意：这里才允许访问 WorkshopApi —— 构造函数阶段 instance 可能还没注入
         config = runCatching {
-            WorkshopApi.manager.createConfigManager().getConfig()
+            WorkshopApi.manager.createConfigManager().getConfig(CFG_MAIN)
+        }.getOrNull()
+        // 「发现与公网」是独立配置组，官方约定每组用各自的配置文件；
+        // 两组共用 config.json 会导致设置页渲染不出来。
+        discoveryConfig = runCatching {
+            WorkshopApi.manager.createConfigManager().getConfig(CFG_DISCOVERY)
         }.getOrNull()
 
         port = readInt(KEY_PORT, DEFAULT_PORT, 1024, 65535)
@@ -102,7 +108,7 @@ class RemotePlugin(
 
         // 自动发现独立于 WebSocket：即使 WebSocket 起不来也先别开广播，
         // 否则会把 APP 引到一个连不上的地址上。
-        if (wsOk && readBool(KEY_DISCOVERY, true)) {
+        if (wsOk && readDiscoveryBool(KEY_DISCOVERY, true)) {
             val disc = DiscoveryService(
                 udpPort = udpPort,
                 payloadProvider = { beaconJson() },
@@ -131,7 +137,7 @@ class RemotePlugin(
         }
 
         // 公网 IP 探测放后台，不阻塞 start()
-        if (readBool(KEY_PUBLIC_IP, true)) {
+        if (readDiscoveryBool(KEY_PUBLIC_IP, true)) {
             background.execute {
                 runCatching { publicIp.resolve(force = true) }
             }
@@ -201,7 +207,7 @@ class RemotePlugin(
      * 关掉之后广播里没有配对码，手机必须手填。
      */
     private fun beaconJson(): String {
-        val trustLan = readBool(KEY_TRUST_LAN, true)
+        val trustLan = readDiscoveryBool(KEY_TRUST_LAN, true)
         return JsonValue.obj(
             "t" to JsonValue.of("spw-remote"),
             "name" to JsonValue.of("Salt Player for Windows"),
@@ -224,6 +230,16 @@ class RemotePlugin(
 
     private fun readBool(key: String, fallback: Boolean): Boolean =
         runCatching { config?.get(key, fallback) }.getOrNull() ?: fallback
+
+    /**
+     * 读「发现与公网」组的开关。
+     *
+     * 这一组在 preference_config.json 里对应独立的 discovery.json，
+     * 所以必须用 [discoveryConfig]，不能复用主配置 —— 否则读到的永远是默认值，
+     * 用户在配置页改了也不生效。
+     */
+    private fun readDiscoveryBool(key: String, fallback: Boolean): Boolean =
+        runCatching { discoveryConfig?.get(key, fallback) }.getOrNull() ?: fallback
 
     /**
      * 配对码。
@@ -359,7 +375,7 @@ class RemotePlugin(
                         // 手机存下来之后，用户就不用手打这 12 个字符了；
                         // 界面上仍然显示它，方便用户告诉第二台设备。
                         "token" to (
-                            if (readBool(KEY_TRUST_LAN, true)) JsonValue.of(authToken)
+                            if (readDiscoveryBool(KEY_TRUST_LAN, true)) JsonValue.of(authToken)
                             else JsonValue.Null
                             ),
                         // 反射读曲目是否可用，排查"不显示曲目"时最有用的一条
@@ -446,6 +462,15 @@ class RemotePlugin(
         const val DEFAULT_TOKEN = "SPW8K3M9"
 
         const val KEY_PORT = "remote.port"
+
+        /**
+         * 配置文件名，必须与 preference_config.json 里各配置组的 `config` 字段逐字一致。
+         *
+         * 官方示例里每个配置组用**各自独立**的文件；两组共用同一个文件会导致
+         * 插件设置页渲染不出任何控件（实测）。
+         */
+        const val CFG_MAIN = "config.json"
+        const val CFG_DISCOVERY = "discovery.json"
         const val KEY_UDP_PORT = "remote.udpPort"
         const val KEY_DISCOVERY = "remote.discovery"
         const val KEY_PUBLIC_IP = "remote.publicIpProbe"

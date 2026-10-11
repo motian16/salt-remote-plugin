@@ -1,4 +1,4 @@
-﻿{
+{
   "configs": [
     {
       "title": "远程遥控",
@@ -29,7 +29,7 @@
     },
     {
       "title": "发现与公网",
-      "config": "config.json",
+      "config": "discovery.json",
       "preferences": [
         {
           "key": "remote.discovery",

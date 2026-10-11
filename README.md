@@ -188,6 +188,10 @@ $env:GITHUB_TOKEN = '<你的 token>'
 | `remote.discovery` | 开 | 关闭后手机必须手动填 IP 和端口 |
 | `remote.publicIpProbe` | 开 | 探测公网 IPv4。纯内网环境可以关掉 |
 
+> 上面两组对应**两个不同的配置文件**：`config.json`（远程遥控）与
+> `discovery.json`（发现与公网）。官方示例里每个配置组用各自独立的文件，
+> **两组共用同一个文件会让设置页渲染不出任何控件**（实测踩过，见下方"已知坑"）。
+
 **改完立即生效的**：
 
 | 配置键 | 默认值 | 说明 |
@@ -359,6 +363,16 @@ src/main/resources/
 
 ---
 
-## 十、许可
+## 十、已知坑
+
+| 现象 | 原因 |
+| --- | --- |
+| 插件装上了、能启用，但**设置页一项都不显示**（空白） | `preference_config.json` 里**多个配置组共用了同一个 `config` 文件**。官方示例中每组用各自的文件，共用会让设置页渲染不出来。本插件 v1.2 及以前就有这个问题，v1.3 拆成 `config.json` + `discovery.json` 后正常 |
+| 改了端口/开关不生效 | 除 `remote.trustLan` 外都在 `start()` 里只读一次，需停用再启用 |
+| CI 报 `./gradlew: Permission denied` | `gradlew` 在 Windows 上被检出为无执行位，见「发布新版本 → CI」 |
+
+---
+
+## 十一、许可
 
 见 [LICENSE](LICENSE)。
