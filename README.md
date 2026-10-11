@@ -56,7 +56,18 @@ Get-FileHash .\plugin-io.github.motian16.spwremote-1.2.spmod -Algorithm SHA256
 tar -tf plugin-io.github.motian16.spwremote-1.2.spmod
 ```
 
-包内 MANIFEST 全部字段（`lib/` 为空，归档里没有这一层目录）：
+包内结构（`lib/` 为空，归档里没有这一层目录）：
+
+```
+plugin-io.github.motian16.spwremote-1.2.spmod
+└── classes/
+    ├── META-INF/MANIFEST.MF      ← 插件元数据，见下
+    ├── META-INF/extensions.idx   ← PF4J 扩展点索引
+    ├── preference_config.json    ← 配置界面声明
+    └── io/github/motian16/spwremote/*.class
+```
+
+包内 MANIFEST 全部字段：
 
 ```
 Plugin-Class:            io.github.motian16.spwremote.RemotePlugin

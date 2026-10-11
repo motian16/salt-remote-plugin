@@ -62,8 +62,24 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Publish release
+      - name: Check whether the release already exists
+        # publish.ps1 会在推送 tag 之前先建好 Release。两边同时想建会失败，
+        # 所以先查一次：已经存在就跳过下面的发布步骤，只保留 artifact。
         if: startsWith(github.ref, 'refs/tags/v')
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; skipping publish."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') && steps.rel.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           files: |
