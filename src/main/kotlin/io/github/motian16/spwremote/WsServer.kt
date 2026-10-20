@@ -1,4 +1,4 @@
-﻿package io.github.motian16.spwremote
+package io.github.motian16.spwremote
 
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
@@ -110,10 +110,24 @@ class WsServer(
         acceptThread = null
     }
 
-    /** 向所有已连接客户端广播一条文本消息 */
+    /**
+     * 向**已配对**的客户端广播一条文本消息。
+     *
+     * 以前这里是"遍历全部连接"，于是同网段任何人只要连上端口（哪怕没有配对码），
+     * 下一次状态广播就能读到 `playing/title/artist/path/pos` —— 配对码保护的只是
+     * "发指令"和"拿地址列表"，播放状态其实是公开的（文档里也标了这个待修项）。
+     *
+     * 现在按 [Client.authed] 过滤：只有配对成功的连接才会收到 `state`。
+     */
     fun broadcast(text: String) {
-        for (c in clients.toList()) c.sendText(text)
+        for (c in clients.toList()) {
+            if (c.authed) c.sendText(text)
+        }
     }
+
+    /** 已配对连接数（状态广播"有没有人听"的判断用它，而不是连接数）。 */
+    val authedClientCount: Int
+        get() = clients.count { it.authed }
 
     private fun acceptLoop(ss: ServerSocket) {
         while (running) {
@@ -174,8 +188,33 @@ class WsServer(
         @Volatile
         private var closed = false
 
+        /**
+         * 这个连接是否已经配对成功。
+         *
+         * 由插件在 `auth` 校验通过时置 true。`broadcast()` 只发给 authed 的连接，
+         * 这是"播放状态不再向未配对连接泄露"的唯一开关。
+         */
+        @Volatile
+        var authed: Boolean = false
+
         val remoteLabel: String
             get() = "${socket.inetAddress?.hostAddress ?: "?"}:${socket.port}"
+
+        /** 远端 IP（不含端口），用于认证失败限流。 */
+        val remoteHost: String
+            get() = socket.inetAddress?.hostAddress ?: "?"
+
+        /**
+         * 主动断开这个连接。
+         *
+         * 认证失败次数超限时由插件调用：回一个 1008（policy violation）再关 socket，
+         * 客户端能立刻知道"不是网络问题，是认证被拒太多次"，而不是反复重连。
+         */
+        fun close(code: Int, reason: String?) {
+            if (closed) return
+            runCatching { sendClose(code, reason) }
+            closeQuietly()
+        }
 
         fun run() {
             try {

@@ -72,7 +72,7 @@ plugin-io.github.motian16.spwremote-1.2.spmod
 ```
 Plugin-Class:            io.github.motian16.spwremote.RemotePlugin
 Plugin-Id:               io.github.motian16.spwremote
-Plugin-Version:          1.2
+Plugin-Version:          1.5
 Plugin-Provider:         motian16
 Plugin-Name:             SPW 远程遥控
 Plugin-Description:      手机遥控电脑播放（局域网/公网）
@@ -245,7 +245,7 @@ WebSocket 文本帧承载 JSON，所有消息都有 `t` 字段。**完整字段�
 ```
 手机 → 插件                                  插件 → 手机
 {"t":"auth","token":"SPW-XXXXXXXX"}    →     authOk
-                                       →     hello   {"ok":true,"protocol":1,...}
+                                       →     hello   {"ok":true,"protocol":2,...}
                                        →     state   {"playing":...,"title":...}
 {"t":"ping","ts":123}                  →     pong    {"ts":123}
 {"t":"netinfo"}                        →     netinfo {"lan":[...],"ipv6":[...],...}
@@ -264,8 +264,8 @@ WebSocket 文本帧承载 JSON，所有消息都有 `t` 字段。**完整字段�
 当前宿主公开接口（`PlaybackExtensionPoint.MediaItem`）只给 **5 个字段**：
 `title`、`artist`、`album`、`albumArtist`、`path`。
 
-- **没有封面**：公开接口没有，内部是 Compose 的 `ImageBitmap`，拿不到原始字节。
-  APP 侧应该用自己的曲库按标题/艺术家匹配本地文件取封面。
+- **封面**：`library.getCoverById(id)`（需 LIBRARY_READ）能拿到内嵌封面原始字节，插件 1.5 起会压成 640px JPEG 随 `trackExtra` 下发。
+  APP 仍优先用自己的曲库封面；本机没有时才用插件这一份。
 - **没有曲目总时长**：所以 `state` 里没有 `duration`，进度条百分比得靠
   APP 侧匹配到的本地曲目时长来算。
 - **`id` 与播放/暂停、进度靠反射**读宿主内部字段（`TrackReflector.kt`），
@@ -296,23 +296,19 @@ node verify-auth.js <IP> 52100 <配对码> wrong-token   # 11 项断言
 | 未配对时的指令 | 拒绝，回 `authRequired` |
 | 未配对时的地址列表 | 不给（`netinfo` 被鉴权门挡住） |
 | UDP 广播内容 | 只有身份和端口；「局域网免配对」**开启时额外带配对码** |
-| **未配对时的状态广播** | ⚠️ **拿得到**：`state` 广播不按连接过滤，未配对的连接同样收得到 |
+| 未配对时的状态广播 | **拿不到**：`WsServer.broadcast` 只发给 `Client.authed = true` 的连接 |
+| 配对失败限流 | 同一 IP 60 秒内失败 5 次即断开连接（close 1008） |
+| 指令限流 | 每连接 1 秒最多 15 条，超出回 `ack(ok=false,"指令过于频繁，已忽略")` 且不执行 |
 | 传输加密 | 无。局域网明文 `ws://` |
 
-**⚠️ 需要特别注意的一点**：`state` 的广播出口会把消息发给**所有已建立的连接**，
-不做配对过滤。所以「连上但没配对」的设备虽然一开始收不到任何东西
-（`onOpen` 只发 `authRequired`），但**在下一次状态广播时就会收到 `state`**。
-也就是说 `playing/title/artist/path` 这些信息对同网段任何连上端口的程序都是可读的。
-
-`docs/数据传输能力.md` 里"配对成功后才推送播放状态"的说法与当前代码不符，
-已在该文档中标注。**要真正挡住这一点，需要在广播出口按配对状态过滤** ——
-属于已知待修项，不要依赖当前的配对来保护"你在听什么"。
+**已修复（1.4）**：`state` 的广播出口以前会发给**所有已建立的连接**，于是"连上但没配对"的设备
+在下一次状态广播时也能收到 `playing/title/artist/path/pos`。现在出口按配对状态过滤
+（`WsServer.Client.authed`），`MediaState` 也用**已配对连接数**做"没人听就不构造 JSON"的短路。
+`docs/协议参考.md`、`docs/数据传输能力.md` 的对应描述已同步。
 
 其他已知限制：
 
 - 连接数上限 `maxClients = 8`，超出直接断开，不做排队。
-- 指令无鉴权之外的保护，也没有限流。
-- 未实现 permessage-deflate 压缩（本场景消息很小，无必要）。
 - 广域网无中转时的方案（Cloudflare Tunnel 等）见
   `../网络遥控与听歌统计插件-架构设计.md` §2.5，尚未实现。
 

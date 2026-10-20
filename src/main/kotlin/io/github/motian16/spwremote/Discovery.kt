@@ -1,4 +1,4 @@
-﻿package io.github.motian16.spwremote
+package io.github.motian16.spwremote
 
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -198,25 +198,88 @@ class DiscoveryService(
  * 所以有缓存时间，并且设置页提供刷新。
  */
 object NetworkProbe {
-    /** 局域网 IPv4（本机自己看到的），不含回环。 */
-    fun lanIpv4(): List<String> {
-        val out = ArrayList<String>()
+    /**
+     * 一条局域网地址 + 它来自哪块网卡。
+     *
+     * @param virtual 是否是**虚拟网卡**（WSL / Hyper-V / VirtualBox / Docker / VPN…）。
+     *   这类地址手机连不回来，必须排在真实网卡后面 —— 用户报的
+     *   "显示 172.26.xx.xx（实际是 192.168.0.106）" 就是它：172.26 属于
+     *   WSL/Hyper-V 的 vEthernet，以前只是按枚举顺序取第一个。
+     */
+    data class Address(val iface: String, val ip: String, val virtual: Boolean)
+
+    /** 网卡名/显示名里出现这些词，就当成虚拟网卡（连不回来，排后面）。 */
+    private val VIRTUAL_HINTS = listOf(
+        "vethernet", "wsl", "hyper-v", "hyperv", "virtualbox", "vbox",
+        "vmware", "virtual", "docker", "br-", "veth", "tailscale", "zerotier",
+        "wireguard", "openvpn", "tap", "tun", "ppp", "vpn", "bluetooth",
+        "npcap", "loopback", "hamachi", "radmin", "clash", "singbox", "sing-box"
+    )
+
+    private fun isVirtualAdapter(name: String, displayName: String?): Boolean {
+        val text = (name + " " + (displayName ?: "")).lowercase()
+        return VIRTUAL_HINTS.any { text.contains(it) }
+    }
+
+    /**
+     * 地址本身的"像不像家里那台电脑"的分数，越小越优先。
+     *
+     * 192.168/16 是家用路由器最常见的网段；10/8 常见于公司网；
+     * 172.16/12 里**大量**是 WSL/Hyper-V/Docker 的虚拟网段，所以排最后。
+     */
+    private fun subnetRank(ip: String): Int = when {
+        ip.startsWith("192.168.") -> 0
+        ip.startsWith("10.") -> 1
+        ip.startsWith("172.") -> {
+            val second = ip.split('.').getOrNull(1)?.toIntOrNull() ?: 0
+            if (second in 16..31) 3 else 2
+        }
+        else -> 4
+    }
+
+    /**
+     * 局域网 IPv4，**已按"手机能不能连回来"排好序**。
+     *
+     * 排序规则（依次比较）：
+     *   1. 真实网卡优先于虚拟网卡；
+     *   2. 192.168 > 10 > 172.16/12（后者基本是虚拟网段）；
+     *   3. 同分时按网卡名字母序，保证每次结果稳定。
+     */
+    fun lanAddresses(): List<Address> {
+        val out = ArrayList<Address>()
         try {
             for (ni in NetworkInterface.getNetworkInterfaces()) {
                 if (!ni.isUp || ni.isLoopback) continue
+                val display = runCatching { ni.displayName }.getOrNull()
+                val virtual = isVirtualAdapter(ni.name.orEmpty(), display)
                 for (ia in ni.interfaceAddresses) {
                     val addr = ia.address
                     if (addr is Inet4Address && !addr.isLoopbackAddress &&
                         addr.isSiteLocalAddress
                     ) {
-                        out.add(addr.hostAddress ?: continue)
+                        val ip = addr.hostAddress ?: continue
+                        // 169.254/16 是链路本地（没拿到 DHCP），不是可用地址
+                        if (ip.startsWith("169.254.")) continue
+                        out.add(Address(ni.name.orEmpty(), ip, virtual))
                     }
                 }
             }
         } catch (_: Throwable) {
         }
-        return out.distinct()
+        return out
+            .distinctBy { it.ip }
+            .sortedWith(
+                compareBy<Address> { it.virtual }
+                    .thenBy { subnetRank(it.ip) }
+                    .thenBy { it.iface.lowercase() }
+            )
     }
+
+    /** 局域网 IPv4（本机自己看到的），不含回环，按可用性排序。 */
+    fun lanIpv4(): List<String> = lanAddresses().map { it.ip }
+
+    /** 最可能"从手机连得回来"的那一个局域网地址。 */
+    fun primaryLanIpv4(): String? = lanAddresses().firstOrNull()?.ip
 
     /**
      * 全局 IPv6 地址。
@@ -259,10 +322,15 @@ object NetworkProbe {
 
     /** 所有可展示的本机地址，供设置页/日志用。 */
     fun describeAll(): String {
-        val lan = lanIpv4()
+        val lan = lanAddresses()
         val v6 = globalIpv6()
         return buildString {
-            append("局域网 IPv4: ").append(lan.joinToString(", ").ifEmpty { "无" })
+            append("局域网 IPv4: ")
+            append(
+                lan.joinToString(", ") {
+                    it.ip + "（" + it.iface + if (it.virtual) "，虚拟网卡）" else "）"
+                }.ifEmpty { "无" }
+            )
             append("；全局 IPv6: ").append(v6.joinToString(", ").ifEmpty { "无" })
         }
     }
@@ -305,6 +373,20 @@ class PublicIpResolver(
         }
         log("公网 IPv4 探测失败（可能没有外网，或几个服务都不可达）")
         return cached // 失败时退回上一次的结果，比返回 null 有用
+    }
+
+    /**
+     * **只读缓存**，绝不做网络请求。
+     *
+     * 给 `netinfo` 用：那是 WebSocket 的读线程，一旦在这里同步探测公网 IP，
+     * 这台设备的所有消息（包括 cmd 的回执）都会被卡住几秒。
+     * 缓存由 start() 时的后台探测预热；没预热到就先返回 null，
+     * 客户端下次连上时会再问一次。
+     */
+    fun cachedOrNull(): String? {
+        val value = cached ?: return null
+        if (System.currentTimeMillis() - cachedAt >= CACHE_MS) return null
+        return value
     }
 
     /**

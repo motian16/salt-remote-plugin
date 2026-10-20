@@ -36,6 +36,9 @@ class RemotePlugin(
     private var mediaState: MediaState? = null
     private var controller: PlaybackController? = null
 
+    /** 换曲时下发封面/完整歌词；没有配对连接时什么都不做。 */
+    private var extras: MediaExtrasSender? = null
+
     private var port: Int = DEFAULT_PORT
     private var udpPort: Int = DEFAULT_UDP_PORT
     private var authToken: String = ""
@@ -83,10 +86,29 @@ class RemotePlugin(
         udpPort = readInt(KEY_UDP_PORT, DEFAULT_UDP_PORT, 1024, 65535)
         authToken = resolveAuthToken()
 
+        var extrasHolder: MediaExtrasSender? = null
         val state = MediaState(
             broadcaster = { broadcastState() },
-            trackSupplier = { readCurrentTrack() }
+            trackSupplier = { readCurrentTrack() },
+            // 「未连接时不发送」：把 WsServer 的**已配对**连接数交给 MediaState，
+            // 让它在构造 state JSON 之前就短路。
+            // 用 authedClientCount 而不是 clientCount：没配对的连接收不到 state，
+            // 为了它们去构造 JSON 就是纯浪费（"无意义的行为减少"）。
+            // 必须是 lambda：这里 server 还是 null（下面 srv 赋值那行才设上），
+            // 直接取一次值会永远是 0，状态就一条都推不出去了。
+            clientCount = { server?.authedClientCount ?: 0 },
+            // 换曲才拉封面/歌词；同一首歌重复事件由 sender 自己去重。
+            onTrackChanged = { extrasHolder?.request() },
+            onLyricsLines = { lines -> extrasHolder?.request(lyricsOverride = lines) }
         )
+        val extrasSender = MediaExtrasSender(
+            snapshotProvider = { state.current() },
+            clientCount = { server?.authedClientCount ?: 0 },
+            send = { message -> server?.broadcast(message) },
+            log = { logLine(it) }
+        )
+        extrasHolder = extrasSender
+        extras = extrasSender
         val ctrl = PlaybackController(state)
         mediaState = state
         controller = ctrl
@@ -166,10 +188,12 @@ class RemotePlugin(
         RemotePlaybackExtension.attach(null)
         runCatching { discovery?.stop() }
         runCatching { server?.stop() }
+        runCatching { extras?.shutdown() }
         runCatching { controller?.shutdown() }
         runCatching { mediaState?.shutdown() }
         discovery = null
         server = null
+        extras = null
         controller = null
         mediaState = null
     }
@@ -186,6 +210,11 @@ class RemotePlugin(
     private fun broadcastState() {
         val srv = server ?: return
         val state = mediaState ?: return
+        // 兜底：MediaState 已经在入队前按连接数短路过了，这里再判一次是为了
+        // "以后有人直接调 broadcastState()"的情况 —— 那时 Protocol.state(...)
+        // 的 JSON 会被白白构造出来，而用户要求未连接时一点多余工作都不做。
+        // 注意用**已配对**连接数：未配对的连接收不到 state（见 WsServer.broadcast）。
+        if (srv.authedClientCount == 0) return
         srv.broadcast(Protocol.state(state.current()))
     }
 
@@ -297,6 +326,26 @@ class RemotePlugin(
             java.util.WeakHashMap<WsServer.Client, Boolean>()
         )
 
+        /**
+         * 认证失败计数：远端 IP → 最近失败时刻。
+         *
+         * 配对码只有 8 位，理论上可以被暴力枚举。以前没有任何限流，一个脚本可以
+         * 每秒试几百次；现在**同一个 IP 在 60 秒内失败 5 次就直接断开连接**，
+         * 让暴力枚举从"分钟级"变成"按天算"。
+         */
+        private val authFailures = java.util.concurrent.ConcurrentHashMap<String, MutableList<Long>>()
+
+        /**
+         * 指令限流：每个连接最近一段时间内执行过的 cmd 时刻。
+         *
+         * 遥控的正常操作（播放/暂停/下一首/拖进度）最多每秒几次；
+         * 给到 [CMD_BURST] 次 / [CMD_WINDOW_MS] 已经非常宽松。超出的指令
+         * **不执行**、直接回一条 ack 错误，避免一个失控的客户端把宿主刷爆。
+         */
+        private val cmdTimes = java.util.Collections.synchronizedMap(
+            java.util.WeakHashMap<WsServer.Client, MutableList<Long>>()
+        )
+
         override fun onOpen(client: WsServer.Client) {
             // 新连接先报"需要配对"，但不推状态 —— 状态要等配对成功再给，
             // 否则同网段任何人连上来就能看到你在听什么。
@@ -328,6 +377,10 @@ class RemotePlugin(
                     val token = fields["token"]?.asStringOrNull().orEmpty()
                     if (token == authToken) {
                         authed.add(client)
+                        // WsServer.broadcast 只发给 authed 的连接：这个标记就是
+                        // "播放状态不再向未配对连接泄露"的开关。
+                        client.authed = true
+                        authFailures.remove(client.remoteHost)
                         client.sendText(Protocol.authOk())
                         // 配对成功才给状态；先主动对一次账，
                         // 这样"已经播着"的情况下也能立刻拿到曲目。
@@ -339,10 +392,29 @@ class RemotePlugin(
                             )
                         )
                         client.sendText(Protocol.state(state.current()))
+                        // 新设备刚连上：强制补一份封面/歌词，不然要等下次换歌才有。
+                        extras?.request(force = true)
                         logLine("客户端 ${client.remoteLabel} 配对成功")
                     } else {
+                        val failures = authFailures
+                            .getOrPut(client.remoteHost) { mutableListOf() }
+                        synchronized(failures) {
+                            val now = System.currentTimeMillis()
+                            failures.removeAll { now - it > AUTH_FAILURE_WINDOW_MS }
+                            failures.add(now)
+                        }
                         client.sendText(Protocol.authFail("配对码不对"))
                         logLine("客户端 ${client.remoteLabel} 配对失败：配对码不对")
+                        // 同一个 IP 短时间内反复失败：直接断开，别让它把配对码试穿。
+                        val recent = synchronized(failures) { failures.size }
+                        if (recent >= AUTH_FAILURE_LIMIT) {
+                            logLine(
+                                "客户端 ${client.remoteLabel} 在 " +
+                                    (AUTH_FAILURE_WINDOW_MS / 1000) + " 秒内配对失败 " +
+                                    recent + " 次，已断开"
+                            )
+                            client.close(1008, "配对失败次数过多，请稍后再试")
+                        }
                     }
                 }
 
@@ -355,6 +427,7 @@ class RemotePlugin(
                     )
                     state.refreshNow()
                     client.sendText(Protocol.state(state.current()))
+                    extras?.request(force = true)
                 }
 
                 "ping" -> client.sendText(Protocol.pong(fields["ts"]?.asLongOrNull()))
@@ -370,7 +443,9 @@ class RemotePlugin(
                         "udpPort" to JsonValue.of(udpPort),
                         "lan" to JsonValue.Arr(NetworkProbe.lanIpv4().map { JsonValue.of(it) }),
                         "ipv6" to JsonValue.Arr(NetworkProbe.globalIpv6().map { JsonValue.of(it) }),
-                        "public" to JsonValue.of(publicIp.resolve()),
+                        // 公网地址只用**缓存**：这里在 WebSocket 读线程上，
+                        // 同步探测会把这台设备的所有消息卡住几秒（包括指令回执）。
+                        "public" to JsonValue.of(publicIp.cachedOrNull()),
                         // 局域网免配对开启时，把配对码一并交接给手机。
                         // 手机存下来之后，用户就不用手打这 12 个字符了；
                         // 界面上仍然显示它，方便用户告诉第二台设备。
@@ -400,6 +475,7 @@ class RemotePlugin(
 
         override fun onClose(client: WsServer.Client) {
             authed.remove(client)
+            cmdTimes.remove(client)
         }
 
         private fun handleCommand(client: WsServer.Client, fields: Map<String, JsonValue>) {
@@ -407,6 +483,16 @@ class RemotePlugin(
             val action = fields["action"]?.asStringOrNull()
             if (action.isNullOrBlank()) {
                 client.sendText(Protocol.ack(id, ok = false, err = "缺少 action 字段"))
+                return
+            }
+
+            // 指令限流：正常遥控一秒最多几次，超过 [CMD_BURST] 次/秒级窗口就拒绝执行。
+            // 目的是"失控的客户端不能把宿主刷爆"，正常用户完全碰不到这条线。
+            if (!allowCommand(client)) {
+                logLine("客户端 ${client.remoteLabel} 指令过于频繁，已忽略一条")
+                client.sendText(
+                    Protocol.ack(id, ok = false, err = "指令过于频繁，已忽略")
+                )
                 return
             }
 
@@ -441,6 +527,18 @@ class RemotePlugin(
             Protocol.ACTION_PREV -> "上一首"
             Protocol.ACTION_SEEK -> "跳转进度"
             else -> action
+        }
+
+        /** 这个连接现在还能不能再执行一条指令（滑动窗口计数）。 */
+        private fun allowCommand(client: WsServer.Client): Boolean {
+            val now = System.currentTimeMillis()
+            val times = cmdTimes.getOrPut(client) { mutableListOf() }
+            synchronized(times) {
+                times.removeAll { now - it > CMD_WINDOW_MS }
+                if (times.size >= CMD_BURST) return false
+                times.add(now)
+            }
+            return true
         }
     }
 
@@ -489,44 +587,108 @@ class RemotePlugin(
          */
         const val KEY_TRUST_LAN = "remote.trustLan"
 
+        /** 同一个 IP 在 [AUTH_FAILURE_WINDOW_MS] 内配对失败这么多次就断开连接。 */
+        private const val AUTH_FAILURE_LIMIT = 5
+        private const val AUTH_FAILURE_WINDOW_MS = 60_000L
+
+        /**
+         * 指令限流：每个连接在 [CMD_WINDOW_MS] 窗口内最多执行 [CMD_BURST] 条。
+         *
+         * 正常遥控（连点下一首、拖进度条）也就每秒几次，给到 1 秒 15 条已经非常宽松；
+         * 超出的指令不执行，只回 ack 错误 —— 防止一个失控的客户端把宿主刷爆。
+         */
+        private const val CMD_BURST = 15
+        private const val CMD_WINDOW_MS = 1_000L
+
         /**
          * 配置页「查看本机网络地址」按钮的回调。
          *
          * 必须是**静态方法**（preference_config.json 的 on_click 只支持静态方法），
          * 所以这里不能依赖插件实例，全部走 NetworkProbe 的静态探测。
-         * 结果同时打到日志和 toast —— 地址可能有好几个，toast 会截断，
-         * 完整列表去 Salt Player 的日志里看。
+         *
+         * ## 为什么必须异步
+         *
+         * 以前这里在点击线程上同步做三件事：枚举网卡、探测公网 IP（最多三个 HTTPS
+         * 端点 × 4 秒）、再弹 toast —— 用户看到的就是"点一下卡住，然后才出来"。
+         * 现在立即回一句"正在探测…"，真正的工作丢到后台线程，探测完再弹结果。
+         *
+         * ## 地址顺序
+         *
+         * 用的是 [NetworkProbe.lanAddresses] 的**排序结果**：真实网卡、
+         * 192.168/10 网段优先，WSL/Hyper-V 之类的 172.x 虚拟网卡排最后。
+         * 以前直接取枚举到的第一个，于是 172.26.x.x 盖过了真正的 192.168.0.106。
          */
         @JvmStatic
         @JvmName("onShowNetworkInfo")
         fun onShowNetworkInfo() {
-            val lan = NetworkProbe.lanIpv4()
-            val v6 = NetworkProbe.globalIpv6()
-            val pub = PublicIpResolver().resolve(force = true)
+            toastOnUi("正在探测本机网络地址…")
 
-            val detail = buildString {
-                append("局域网 IPv4: ")
-                append(lan.joinToString(", ").ifEmpty { "无" })
-                append("\n全局 IPv6: ")
-                append(v6.joinToString(", ").ifEmpty { "无" })
-                append("\n公网 IPv4: ")
-                append(pub ?: "探测失败（内网环境或无法访问外网）")
-            }
-            println("[spw-remote] ===== 本机网络地址 =====")
-            println("[spw-remote] $detail")
-            println("[spw-remote] ========================")
+            Thread({
+                // 只有用户开着「探测公网 IP」才去问外网，否则这一步纯属浪费流量和时间。
+                val probePublic = runCatching {
+                    WorkshopApi.manager.createConfigManager()
+                        .getConfig(CFG_DISCOVERY)
+                        .get(KEY_PUBLIC_IP, true)
+                }.getOrDefault(true)
 
-            val summary = when {
-                lan.isNotEmpty() -> "局域网：${lan.first()}"
-                v6.isNotEmpty() -> "IPv6：${v6.first()}"
-                pub != null -> "公网：$pub"
-                else -> "未发现可用地址"
-            }
-            runCatching {
-                WorkshopApi.ui.toast(
-                    "本机地址 $summary（完整列表见日志）",
-                    WorkshopApi.Ui.ToastType.Success
-                )
+                val lan = runCatching { NetworkProbe.lanAddresses() }.getOrDefault(emptyList())
+                val v6 = runCatching { NetworkProbe.globalIpv6() }.getOrDefault(emptyList())
+                val pub = if (probePublic) {
+                    runCatching { PublicIpResolver().resolve(force = true) }.getOrNull()
+                } else {
+                    null
+                }
+
+                val detail = buildString {
+                    append("局域网 IPv4（按可用性排序）:\n")
+                    if (lan.isEmpty()) append("  无")
+                    lan.forEach { a ->
+                        append("  ").append(a.ip).append("  [").append(a.iface).append("]")
+                        if (a.virtual) append("  ← 虚拟网卡，手机通常连不回来")
+                        append('\n')
+                    }
+                    append("全局 IPv6: ").append(v6.joinToString(", ").ifEmpty { "无" })
+                    append("\n公网 IPv4: ")
+                    append(
+                        when {
+                            pub != null -> pub
+                            !probePublic -> "未探测（配置里已关闭）"
+                            else -> "探测失败（内网环境或无法访问外网）"
+                        }
+                    )
+                }
+                println("[spw-remote] ===== 本机网络地址 =====")
+                println("[spw-remote] $detail")
+                println("[spw-remote] ========================")
+
+                val primary = lan.firstOrNull()
+                val summary = when {
+                    primary != null && !primary.virtual -> "局域网：" + primary.ip
+                    primary != null -> "局域网：" + primary.ip + "（虚拟网卡，建议核对）"
+                    v6.isNotEmpty() -> "IPv6：" + v6.first()
+                    pub != null -> "公网：" + pub
+                    else -> "未发现可用地址"
+                }
+                toastOnUi("本机地址 $summary（完整列表见日志）")
+            }, "spw-netinfo").apply { isDaemon = true }.start()
+        }
+
+        /**
+         * 从任意线程弹一条 toast。
+         *
+         * 插件的 `ui.toast` 是给 UI 层用的，不能在后台线程直接调；这里回到 AWT
+         * 事件线程再弹。取不到 EDT（理论上不会发生）就退回直接调用，绝不抛。
+         */
+        private fun toastOnUi(text: String) {
+            val shown = runCatching {
+                javax.swing.SwingUtilities.invokeLater {
+                    runCatching {
+                        WorkshopApi.ui.toast(text, WorkshopApi.Ui.ToastType.Success)
+                    }
+                }
+            }.isSuccess
+            if (!shown) {
+                runCatching { WorkshopApi.ui.toast(text, WorkshopApi.Ui.ToastType.Success) }
             }
         }
     }

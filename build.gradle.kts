@@ -1,3 +1,4 @@
+import com.xuncorp.spw.workshop.gradle.PluginPermission
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -49,8 +50,11 @@ spmod {
     // UTF-8 中文字符导致宿主读出乱码，所以介绍必须保持在一行以内
     // （前缀 "Plugin-Description: " 占 20 字节，正文控制在 ~50 字节）。
     PluginDescription = "手机遥控电脑播放（局域网/公网）"
-    PluginVersion = "1.3"
+    PluginVersion = "1.5"
     PluginProvider = "motian16"
+    // 封面通过 library.getCoverById 读取（宿主要求声明并授权 LIBRARY_READ）。
+    // 歌词走 playback.getLyricsLines，不需要额外权限。
+    PluginPermissions = listOf(PluginPermission.LIBRARY_READ)
     // 生成 MANIFEST 里的 Plugin-Open-Source-Url，供宿主展示插件来源
     PluginOpenSourceUrl = "https://github.com/motian16/salt-remote-plugin"
     PluginHasConfig = true

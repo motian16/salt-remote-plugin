@@ -1,4 +1,4 @@
-﻿package io.github.motian16.spwremote
+package io.github.motian16.spwremote
 
 /**
  * 遥控协议定义（WebSocket 文本帧承载 JSON）。
@@ -20,7 +20,7 @@
  *   {"t":"error","err":"..."}
  */
 object Protocol {
-    const val VERSION = 1
+    const val VERSION = 2
 
     const val ACTION_PLAY = "play"
     const val ACTION_PAUSE = "pause"
@@ -81,6 +81,9 @@ object Protocol {
         "albumArtist" to JsonValue.of(snapshot.albumArtist),
         "path" to JsonValue.of(snapshot.path),
         "pos" to JsonValue.of(snapshot.positionMs),
+        // 宿主 dev21+ 的 MediaItem.duration；旧宿主为 0。
+        // 手机侧优先用自己的曲库时长，拿不到时用这个画真实百分比。
+        "duration" to JsonValue.of(snapshot.durationMs),
         // id 来自宿主内部字段（见 TrackReflector），拿不到时是空串。
         // APP 侧应该把它当"可能为空"的提示，不能当主键依赖。
         "id" to JsonValue.of(snapshot.id),
@@ -112,8 +115,13 @@ data class MediaSnapshot(
     val path: String,
     val positionMs: Long,
     val id: String = "",
-    val lyricLine: String = ""
+    val lyricLine: String = "",
+    /** 曲目总时长（毫秒）。宿主 dev21+ 提供；旧宿主为 0。 */
+    val durationMs: Long = 0L
 ) {
+    /** 手机侧用它把 state 与封面/歌词对应起来，格式与 APP 的 keyOf 一致。 */
+    val key: String get() = id + "|" + path + "|" + title + "|" + artist
+
     companion object {
         val EMPTY = MediaSnapshot(
             playing = false,

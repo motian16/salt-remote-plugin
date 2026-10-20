@@ -1,4 +1,4 @@
-﻿package io.github.motian16.spwremote
+package io.github.motian16.spwremote
 
 import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint
 import org.pf4j.Extension
@@ -36,6 +36,15 @@ class RemotePlaybackExtension : PlaybackExtensionPoint {
 
     override fun onPositionUpdated(position: Long) {
         instance?.onPositionUpdated(position)
+    }
+
+    override fun onLyricsLineUpdated(lyricsLine: PlaybackExtensionPoint.LyricsLine?) {
+        instance?.onLyricLine(lyricsLine)
+    }
+
+    override fun onLyricsLinesUpdated(lyricsLines: List<PlaybackExtensionPoint.LyricsLine>) {
+        // 完整时间轴：换曲后宿主可能晚一拍才给，所以它也是封面/歌词补发的触发点。
+        instance?.onLyricsTimeline(lyricsLines)
     }
 
     override fun onStateChanged(state: PlaybackExtensionPoint.State) {
