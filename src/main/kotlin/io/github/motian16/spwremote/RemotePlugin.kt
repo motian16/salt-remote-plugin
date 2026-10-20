@@ -601,6 +601,42 @@ class RemotePlugin(
         private const val CMD_WINDOW_MS = 1_000L
 
         /**
+         * 配置页「下载 AudioMeta App」按钮的回调。
+         *
+         * 打开 GitHub 的最新发行版页面。用 AWT Desktop 走系统默认浏览器；
+         * 宿主没有桌面/浏览器时退回复制地址并提示，保证按钮不会静默失败。
+         */
+        @JvmStatic
+        @JvmName("onOpenAppDownload")
+        fun onOpenAppDownload() {
+            val url = "https://github.com/motian16/AudioMeta/releases/latest"
+            Thread({
+                val opened = runCatching {
+                    if (!java.awt.Desktop.isDesktopSupported()) {
+                        error("系统不支持打开浏览器")
+                    }
+                    val desktop = java.awt.Desktop.getDesktop()
+                    if (!desktop.isSupported(java.awt.Desktop.Action.BROWSE)) {
+                        error("系统没有可用的浏览器")
+                    }
+                    desktop.browse(java.net.URI(url))
+                }.isSuccess
+
+                if (opened) {
+                    toastOnUi("已打开 AudioMeta 下载页")
+                } else {
+                    runCatching {
+                        java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(
+                            java.awt.datatransfer.StringSelection(url),
+                            null
+                        )
+                    }
+                    toastOnUi("下载地址已复制：" + url)
+                }
+            }, "spw-open-app-download").apply { isDaemon = true }.start()
+        }
+
+        /**
          * 配置页「查看本机网络地址」按钮的回调。
          *
          * 必须是**静态方法**（preference_config.json 的 on_click 只支持静态方法），

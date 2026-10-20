@@ -24,6 +24,13 @@
           "title": "配对码",
           "summary": "手机首次连接时要填这个。首次运行随机生成，可自行修改。留空会重新随机生成一个",
           "default_value": ""
+        },
+        {
+          "type": "button",
+          "title": "下载 AudioMeta App",
+          "summary": "打开 GitHub 发行版页面，下载 Android 客户端",
+          "arrow_type": "none",
+          "on_click": "io.github.motian16.spwremote.RemotePlugin.onOpenAppDownload"
         }
       ]
     },
